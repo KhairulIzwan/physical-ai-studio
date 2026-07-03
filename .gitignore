@@ -210,3 +210,4 @@ __marimo__/
 tmp*
 lightning_logs
 .DS_Store
+node_modules/
