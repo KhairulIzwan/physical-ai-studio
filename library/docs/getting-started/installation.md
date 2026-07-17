@@ -22,6 +22,24 @@ Check your version:
 python --version
 ```
 
+### uv package manager
+
+From-source installation uses uv. Install it first:
+
+```bash
+# Linux/macOS
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# If uv is not found in the current shell
+source "$HOME/.local/bin/env"
+```
+
+Verify installation:
+
+```bash
+uv --version
+```
+
 ### FFMPEG
 
 FFMPEG is required for video processing (used by LeRobot datasets):

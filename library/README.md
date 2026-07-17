@@ -53,6 +53,16 @@ pip install physicalai-train
 
 PhysicalAI Library requires Python 3.12+.
 
+The source install flow uses uv. Install uv first:
+
+```bash
+# Linux/macOS
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# If uv is not found in the current shell
+source "$HOME/.local/bin/env"
+```
+
 FFMPEG is required as a dependency of LeRobot:
 
 ```bash

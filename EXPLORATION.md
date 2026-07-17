@@ -6,6 +6,12 @@
 > **Related repo:** For inference/benchmarking only, see
 > [openvinotoolkit/physicalai](https://github.com/KhairulIzwan/physicalai/blob/exploration/panther-lake-benchmark/EXPLORATION.md)
 
+## 0. Quick Preview
+
+![Physical AI Studio screenshot](image.png)
+
+Initial UI bring-up on this platform.
+
 ---
 
 ## 1. What is Physical AI Studio?
@@ -27,6 +33,15 @@ physical-ai-studio/
 ## 2. Environment Setup
 
 Physical AI Studio uses `uv` for dependency management (separate from physicalai's pip venv).
+
+Install `uv` first (one-time):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# If uv is not found in the current shell
+source "$HOME/.local/bin/env"
+```
 
 ```bash
 # Clone
@@ -138,15 +153,20 @@ sudo apt-get install -y ffmpeg libgl1 libglib2.0-0 libusb-1.0-0 libusb-1.0-0-dev
 
 ### Also required (one-time)
 ```bash
+# From physical-ai-studio root (if you're currently in library/, run: cd ..)
+
 # Node.js v24
 curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
 sudo apt-get install -y nodejs
 
 # UI dependencies
-cd application/ui && npm install
+cd /home/user/physical-ai-studio/application/ui && npm install
+
+# Ensure uv is available in this shell
+source "$HOME/.local/bin/env"
 
 # Backend dependencies
-cd application/backend && uv sync --extra xpu  # or --extra cpu
+cd /home/user/physical-ai-studio/application/backend && uv sync --extra xpu  # or --extra cpu
 ```
 
 ### Start Backend (Terminal 1)
@@ -170,6 +190,11 @@ Open **http://localhost:3000** in browser.
 - UI: React app built in 3.71s via Rsbuild v2.0.15
 - Framework: FastAPI 0.138.0 | uvicorn | SQLite DB
 
+### Note on npm warnings
+- `npm install` may print deprecation warnings for transitive dependencies and `allow-scripts` review prompts.
+- These are non-blocking for current setup when install finishes successfully and `npm run build` passes.
+- Keep dependencies updated over time, but do not treat these warnings as immediate setup failures.
+
 ### Available UI Workflows
 1. Create a project
 2. Set up robot + camera hardware
@@ -180,7 +205,55 @@ Open **http://localhost:3000** in browser.
 
 ---
 
-## 6. Next Steps / TODO
+## 6. Simulation vs Real Robot
+
+Short answer: **both are supported**.
+
+- You can do substantial development in simulation only (train, benchmark, export).
+- You need a real robot only for hardware data collection and final on-robot validation/deployment.
+
+### Simulation-first workflow (recommended first)
+
+```bash
+cd /home/user/physical-ai-studio/library
+
+# 1) Train on sim demonstrations
+uv run physicalai fit \
+  --model physicalai.policies.ACT \
+  --data physicalai.data.LeRobotDataModule \
+  --data.repo_id lerobot/aloha_sim_transfer_cube_human \
+  --trainer.max_epochs 10
+
+# 2) Benchmark in simulation (LIBERO)
+uv run physicalai benchmark \
+  --benchmark physicalai.benchmark.gyms.LiberoBenchmark \
+  --benchmark.task_suite libero_10 \
+  --benchmark.num_episodes 20 \
+  --policy physicalai.policies.ACT \
+  --ckpt_path experiments/lightning_logs/version_0/checkpoints/last.ckpt
+
+# 3) Export for deployment testing
+uv run python -c "
+from physicalai.policies import ACT
+policy = ACT.load_from_checkpoint('experiments/lightning_logs/version_0/checkpoints/last.ckpt')
+policy.export('./policy_export', backend='openvino')
+print('Exported to ./policy_export')
+"
+```
+
+### Real-robot workflow (when hardware is ready)
+
+- Start with the same policy/export pipeline as simulation.
+- Connect robot + camera, then use the Studio app (`application/backend` + `application/ui`) for project setup and dataset recording.
+- Run inference/control loop on real observations and perform safety-limited validation first.
+
+Practical sequence:
+1. Validate policy behavior in simulation.
+2. Export model and verify inference latency on target hardware.
+3. Connect robot/camera and test short, low-speed episodes.
+4. Scale up only after stable success and safety checks.
+
+## 7. Next Steps / TODO
 
 - [ ] Train ACT policy on LIBERO simulation dataset
 - [ ] Export trained model to OpenVINO IR format
