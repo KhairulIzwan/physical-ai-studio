@@ -12,5 +12,6 @@ set -euo pipefail
 # -----------------------------------------------------------------------------
 
 export PYTHONUNBUFFERED=1
+export LIBRARY_PATH="$PWD/.venv/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
 exec uv run --no-sync physicalai-studio serve
