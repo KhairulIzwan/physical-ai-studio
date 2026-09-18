@@ -5,9 +5,11 @@ import { Add, Close } from '@geti-ui/ui/icons';
 
 import { $api } from '../../../api/client';
 import { useProjectId } from '../../../features/projects/use-project';
-import { isFollower, isLeader } from '../robots-configuration';
+import { useIsRobotRole } from '../robot-catalog.hooks';
+import { isUnavailableRobot } from '../robot-types';
 import { RobotConfiguration, useEnvironmentForm, useSetEnvironmentForm } from './provider';
 
+import addResourceButtonClasses from '../../../components/add-resource-button/add-resource-button.module.css';
 import classes from './form.module.css';
 
 const RobotListItem = ({ robot, onRemove }: { robot: RobotConfiguration; onRemove: () => void }) => {
@@ -70,9 +72,14 @@ export const AddRobotForm = ({
     const robotsQuery = $api.useSuspenseQuery('get', '/api/projects/{project_id}/robots', {
         params: { path: { project_id } },
     });
+    const { isFollower, isLeader } = useIsRobotRole();
     const environment = useEnvironmentForm();
 
     const availableRobots = robotsQuery.data.filter((robot) => {
+        if (isUnavailableRobot(robot)) {
+            return false;
+        }
+
         return (
             environment.robots.some(({ robot_id, teleoperator }) => {
                 if (robot_id === robot.id) {
@@ -222,7 +229,7 @@ export const RobotForm = () => {
             ) : environmentForm.robots.length === 0 ? (
                 <Button
                     variant='secondary'
-                    UNSAFE_className={classes.addNewButton}
+                    UNSAFE_className={addResourceButtonClasses.addResourceButton}
                     width='100%'
                     onPress={() => {
                         setIsAdding(true);

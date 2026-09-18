@@ -27,7 +27,7 @@ permissions: {} # No permissions by default
 jobs:
   validate:
     name: Validate inputs and RC tag
-    runs-on: ${{ github.repository_owner == 'open-edge-platform' && 'overflow' || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
@@ -38,11 +38,11 @@ jobs:
       docker_patch_tag: ${{ steps.validate.outputs.docker_patch_tag }}
     steps:
       - name: Harden the runner (audit all outbound calls)
-        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
 
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -149,12 +149,12 @@ jobs:
     needs: validate
     if: inputs.dry_run == false
     name: Create release git tag
-    runs-on: ${{ github.repository_owner == 'open-edge-platform' && 'overflow' || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     permissions:
       contents: write # Permission to push release tag to git
     steps:
       - name: Harden the runner (audit all outbound calls)
-        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
 
@@ -195,7 +195,7 @@ jobs:
     needs: [validate, create-release-tag]
     if: inputs.dry_run == false
     name: Promote RC image to release image
-    runs-on: ${{ github.repository_owner == 'open-edge-platform' && 'overflow' || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
     permissions:
       packages: write # Permission to push packages to GHCR
       id-token: write # Permission to request OIDC token for signing images
@@ -208,12 +208,12 @@ jobs:
       DEVICE: ${{ matrix.device }}
     steps:
       - name: Harden the runner (audit all outbound calls)
-        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
           egress-policy: audit
 
       - name: Log in to GHCR
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -224,11 +224,12 @@ jobs:
           DOCKER_RC_TAG: ${{ needs.validate.outputs.docker_rc_tag }}
           DOCKER_PATCH_TAG: ${{ needs.validate.outputs.docker_patch_tag }}
           DEVICE: ${{ matrix.device }}
+          OWNER: ${{ github.repository_owner }}
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
-          SOURCE_IMAGE="ghcr.io/open-edge-platform/physical-ai-studio-${DEVICE}:${DOCKER_RC_TAG}"
-          TARGET_IMAGE="ghcr.io/open-edge-platform/physical-ai-studio-${DEVICE}:${DOCKER_PATCH_TAG}"
+          SOURCE_IMAGE="ghcr.io/${OWNER}/physical-ai-studio-${DEVICE}:${DOCKER_RC_TAG}"
+          TARGET_IMAGE="ghcr.io/${OWNER}/physical-ai-studio-${DEVICE}:${DOCKER_PATCH_TAG}"
 
           echo "Pulling ${SOURCE_IMAGE}"
           docker pull "${SOURCE_IMAGE}"
@@ -259,17 +260,18 @@ jobs:
       - name: Sign Docker image
         uses: open-edge-platform/geti-ci/actions/sign-image@7d25e47329bbfcde4ee51ab3581aea8613e245e2
         with:
-          image-uri: ghcr.io/open-edge-platform/physical-ai-studio-${{ matrix.device }}:${{ needs.validate.outputs.docker_patch_tag }}
+          image-uri: ghcr.io/${{ github.repository_owner }}/physical-ai-studio-${{ matrix.device }}:${{ needs.validate.outputs.docker_patch_tag }}
 
       - name: Print summary
         env:
           DOCKER_PATCH_TAG: ${{ needs.validate.outputs.docker_patch_tag }}
           DEVICE: ${{ matrix.device }}
+          OWNER: ${{ github.repository_owner }}
         run: |
           {
             echo "## Promotion Complete"
             echo ""
             echo "### Docker Images"
-            echo "- \`ghcr.io/open-edge-platform/physical-ai-studio-${DEVICE}:${DOCKER_PATCH_TAG}\`"
+            echo "- \`ghcr.io/${OWNER}/physical-ai-studio-${DEVICE}:${DOCKER_PATCH_TAG}\`"
             echo ""
           } >> "${GITHUB_STEP_SUMMARY}"

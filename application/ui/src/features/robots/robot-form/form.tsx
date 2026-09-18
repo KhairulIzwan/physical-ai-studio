@@ -1,20 +1,21 @@
-import { useRef, type FormEvent } from 'react';
+import { useEffect } from 'react';
 
-import { Button, Divider, Flex, Form, Heading, Icon, Item, Picker, TextField } from '@geti-ui/ui';
-import { ChevronLeft } from '@geti-ui/ui/icons';
+import { Item, Picker, TextField } from '@geti-ui/ui';
 
+import { $api } from '../../../api/client';
+import { FormHeading } from '../../../components/form-heading/form-heading';
 import { useProjectId } from '../../../features/projects/use-project';
 import { paths } from '../../../router';
+import { useRobotCatalogQuery } from '../robot-catalog.hooks';
 import { SchemaRobotType } from '../robot-types';
-import { SO101FormFields } from './catalog/so101';
-import { WidowxAIFormFields } from './catalog/widowxai';
-import { BiManualWidowxAIFormFields } from './catalog/widowxai-bimanual';
-import { useRobotForm, useRobotFormFields, useSetRobotForm } from './provider';
-import { SubmitNewRobotButton } from './submit-new-robot-button';
+import { BimanualSO101FormFields } from './catalog/bimanual-so101';
+import { useRobotForm } from './provider';
+import { SchemaForm } from './robot-schema/schema-form';
 
-const RobotType = () => {
-    const { activeType } = useRobotForm();
-    const { setActiveType } = useSetRobotForm();
+export const RobotType = () => {
+    const { activeType, name, setName } = useRobotForm();
+    const { setActiveType } = useRobotForm();
+    const catalogQuery = useRobotCatalogQuery();
 
     return (
         <Picker
@@ -23,91 +24,74 @@ const RobotType = () => {
             width='100%'
             selectedKey={activeType}
             onSelectionChange={(selected) => {
-                if (selected !== null) {
-                    setActiveType(selected as SchemaRobotType);
+                if (selected === null) {
+                    return;
+                }
+                const entry = catalogQuery.data.find(({ type }) => type === selected);
+                setActiveType(selected.toString());
+                if (entry === undefined) {
+                    return;
+                }
+                const previousSuggestedName = catalogQuery.data.find(({ type }) => type === activeType)?.display_name;
+                if (name === '' || name === previousSuggestedName) {
+                    setName(entry.display_name);
                 }
             }}
         >
-            <Item key={'SO101_Follower'}>SO101 Follower</Item>
-            <Item key={'SO101_Leader'}>SO101 Leader</Item>
-            <Item key={'Trossen_WidowXAI_Follower'}>Trossen WidowX AI Follower</Item>
-            <Item key={'Trossen_WidowXAI_Leader'}>Trossen WidowX AI Leader</Item>
-            <Item key={'Trossen_Bimanual_WidowXAI_Follower'}>Trossen Bimanual WidowX AI Follower</Item>
-            <Item key={'Trossen_Bimanual_WidowXAI_Leader'}>Trossen Bimanual WidowX AI Leader</Item>
+            {catalogQuery.data.map((entry) => (
+                <Item key={entry.type}>{entry.display_name}</Item>
+            ))}
         </Picker>
     );
 };
 
-const FormFields = ({ robotType }: { robotType: SchemaRobotType }) => {
-    switch (robotType) {
-        case 'SO101_Follower':
-        case 'SO101_Leader':
-            return <SO101FormFields />;
-        case 'Trossen_WidowXAI_Follower':
-        case 'Trossen_WidowXAI_Leader':
-            return <WidowxAIFormFields />;
-        case 'Trossen_Bimanual_WidowXAI_Leader':
-        case 'Trossen_Bimanual_WidowXAI_Follower':
-            return <BiManualWidowxAIFormFields />;
-    }
-};
+export const FormFields = () => {
+    const { activeType, name, setName, nameFieldRef } = useRobotForm();
+    const catalogQuery = useRobotCatalogQuery();
+    const suggestedName = catalogQuery.data.find(({ type }) => type === activeType)?.display_name;
 
-export const RobotForm = ({ heading = 'Add new robot', submitButton = <SubmitNewRobotButton /> }) => {
-    const { project_id } = useProjectId();
-
-    const { activeType } = useRobotForm();
-    const { formData: activeFormData, updateField } = useRobotFormFields();
-
-    const submitContainerRef = useRef<HTMLDivElement>(null);
-
-    // Make Enter behave like clicking the submit button. A disabled button ignores
-    // the click, so validation still applies.
-    const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
-        event.preventDefault();
-        submitContainerRef.current?.querySelector('button')?.click();
-    };
+    useEffect(() => {
+        if (name !== '' && name === suggestedName) {
+            nameFieldRef.current?.focus();
+        }
+    }, [name, nameFieldRef, suggestedName]);
 
     return (
-        <Flex direction='column' gap='size-200'>
-            <Flex alignItems={'center'} gap='size-200'>
-                <Button
-                    href={paths.project.robots.index({ project_id })}
-                    variant='secondary'
-                    UNSAFE_style={{ border: 'none' }}
-                >
-                    <Icon>
-                        <ChevronLeft color='white' fill='white' />
-                    </Icon>
-                </Button>
+        <>
+            <TextField
+                isRequired
+                label='Robot name'
+                width='100%'
+                value={name}
+                onChange={setName}
+                ref={nameFieldRef}
+                // eslint-disable-next-line jsx-a11y/no-autofocus
+                autoFocus
+            />
+            {activeType !== undefined && <SelectedRobotFields activeType={activeType} />}
+        </>
+    );
+};
 
-                <Heading>{heading}</Heading>
-            </Flex>
-            <Divider orientation='horizontal' size='S' />
-            {/* Prevent native form submission, which reloads the page and discards form state.
-                Advancing to the next step is handled by the submit button's onPress. */}
-            <Form onSubmit={handleSubmit}>
-                <Flex direction='column' gap='size-200'>
-                    <Flex direction='column' gap='size-200' width='100%'>
-                        <TextField
-                            isRequired
-                            label='Robot name'
-                            width='100%'
-                            onChange={(name) => {
-                                updateField('name', name);
-                            }}
-                            value={activeFormData.name}
-                        />
+const SelectedRobotFields = ({ activeType }: { activeType: string }) => {
+    const schema = useRobotCatalogSchema(activeType);
+    const isBimanualSO101 = activeType === 'BimanualSO101_Follower' || activeType === 'BimanualSO101_Leader';
+    return isBimanualSO101 ? (
+        <BimanualSO101FormFields />
+    ) : (
+        <SchemaForm schema={schema.data as Parameters<typeof SchemaForm>[0]['schema']} />
+    );
+};
 
-                        {/* Put robot type first as we can use it to visualize the robot
-                          and determine how to connect with it */}
-                        <RobotType />
+const useRobotCatalogSchema = (robotType: SchemaRobotType) => {
+    return $api.useSuspenseQuery('get', '/api/robots/catalog/{robot_type}/schema', {
+        params: { path: { robot_type: robotType } },
+    });
+};
 
-                        <FormFields robotType={activeType} />
-                    </Flex>
-                    <Divider orientation='horizontal' size='S' />
-                    <div ref={submitContainerRef}>{submitButton}</div>
-                </Flex>
-            </Form>
-        </Flex>
+export const RobotFormHeading = ({ heading }: { heading: string }) => {
+    const { project_id } = useProjectId();
+    return (
+        <FormHeading heading={heading} backTo={paths.project.robots.index({ project_id })} backLabel='Back to robots' />
     );
 };

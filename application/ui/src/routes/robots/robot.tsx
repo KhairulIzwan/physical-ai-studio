@@ -2,23 +2,32 @@ import { useState } from 'react';
 
 import { Button, ButtonGroup, Flex, Grid, View } from '@geti-ui/ui';
 
-import { $api } from '../../api/client';
 import { JointControls } from '../../features/robots/controller/joint-controls';
-import { RobotViewer } from '../../features/robots/controller/robot-viewer';
+import { RobotViewer, UnavailableRobotViewer } from '../../features/robots/controller/robot-viewer';
+import { useCatalogIdentifyMutation } from '../../features/robots/robot-catalog.hooks';
 import { RobotModelsProvider } from '../../features/robots/robot-models-context';
+import { AvailableSchemaRobot, isUnavailableRobot } from '../../features/robots/robot-types';
 import { useRobot } from '../../features/robots/use-robot';
 
 export const Robot = () => {
     const robot = useRobot();
+    return isUnavailableRobot(robot) ? (
+        <UnavailableRobotViewer robotType={robot.type} />
+    ) : (
+        <AvailableRobot robot={robot} />
+    );
+};
 
-    const identifyMutation = $api.useMutation('post', '/api/hardware/identify', {
-        meta: { skipInvalidation: true },
-    });
+const AvailableRobot = ({ robot }: { robot: AvailableSchemaRobot }) => {
+    const identifyMutation = useCatalogIdentifyMutation();
 
     const onIdentify = identifyMutation.isPending
         ? undefined
         : () => {
-              identifyMutation.mutate({ body: robot });
+              identifyMutation.mutate({
+                  params: { path: { robot_type: robot.type } },
+                  body: robot.payload,
+              });
           };
 
     const [isConnected, setIsConnected] = useState(false);

@@ -1,8 +1,18 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from schemas.hardware import DeviceType, InferenceBackend
 from services.system_service import SystemService
+
+
+@pytest.fixture(autouse=True)
+def _reset_openvino_core_cache():
+    """Reset the process-wide OpenVINO Core cache so each test sees its own mock."""
+    SystemService._get_openvino_core.cache_clear()
+    yield
+    SystemService._get_openvino_core.cache_clear()
 
 
 def _device_props(name: str, total_memory: int) -> SimpleNamespace:
@@ -105,3 +115,20 @@ def test_get_inference_devices_uses_openvino_fallback_values() -> None:
     assert devices[-1].name == "GPU.1"
     assert devices[-1].memory is None
     assert devices[-1].index == 1
+
+
+def test_get_available_training_devices_returns_studio_host_devices() -> None:
+    import asyncio
+
+    from schemas.hardware import DeviceInfo
+
+    local_devices = [DeviceInfo(type=DeviceType.CPU, name="CPU", memory=None, index=None)]
+    with patch(
+        "services.system_service.SystemService.get_training_devices",
+        return_value=local_devices,
+    ):
+        result = asyncio.run(SystemService.get_available_training_devices())
+
+    assert result.mode == "local"
+    assert result.remote_available is True
+    assert result.devices == local_devices

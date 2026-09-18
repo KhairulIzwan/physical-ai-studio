@@ -10,9 +10,12 @@ dependencies = [
   "cv2-enumerate-cameras",
   'harvesters; sys_platform != "darwin"',
   "fastapi[standard]<1",
-  "physicalai-train[pi0,smolvla]",
-  "physicalai[robots, capture]",
-  "lerobot[feetech]==0.5.1",
+  "physicalai[robots, capture, transport]",
+  "eclipse-zenoh==1.9.0",
+  "msgpack==1.2.1",
+  "physicalai-train[pi0,smolvla,rldx1]",
+  "lerobot[dataset,feetech]==0.6.0",
+  "torchcodec==0.11.1",
   "numpy",
   "websockets",
   'pyrealsense2-macosx; sys_platform == "darwin"',
@@ -25,19 +28,24 @@ dependencies = [
   "alembic>=1.16.5",
   "click>=8.3.0",
   "loguru>=0.7.3",
+  "omegaconf>=2.3.0",
   "greenlet>=3.2.4",
   "tenacity>=9.1.2",
   "aiofiles>=25.1.0",
   "types-aiofiles>=25.1.0.20251011",
   "sse-starlette>=2.0.0",
-  "executorch>=1.1.0",
-  # Executorch pulls in torchao transitively; use an exact public version so
-  # uv doesn't select XPU local-version wheels (e.g. 0.15.0+xpu) for CUDA runs.
-  "torchao===0.15.0",
+  "huggingface-hub>=0.27",
+  "psutil~=7.2",
+  "physicalai-studio-plugin>=0.2.0",
+  "asyncssh~=2.24",
+  "packaging>=24.0",
+  "sigstore>=4.0,<5",
 ]
 
 [project.scripts]
 physicalai-studio = "cli:cli"
+# Serves only the remote training service (src/trainer).
+physicalai-trainer = "trainer.cli:trainer"
 
 [build-system]
 requires = ["hatchling"]
@@ -54,31 +62,41 @@ exclude = [
 [tool.hatch.build.hooks.custom]
 path = "scripts/hatch_build.py"
 
-
 [project.optional-dependencies]
+# executorch enables the ExecuTorch export backend. It conflicts with the xpu
+# torch build (see library conflicts), so it ships only with cpu/cuda.
 cpu = [
-    "torch<2.13",
-    "torchvision<0.26.0",
+    "torch>=2.11,<2.12",
+    "torchvision>=0.26,<0.27",
+    "physicalai-train[executorch]",
 ]
 cuda = [
-    "torch<2.13",
-    "torchvision<0.26.0",
+    "torch>=2.11,<2.12",
+    "torchvision>=0.26,<0.27",
+    "physicalai-train[executorch]",
 ]
 xpu = [
-    "torch<2.13",
-    "torchvision<0.26.0",
-    "pytorch-triton-xpu ; sys_platform == 'linux' or sys_platform == 'win32'",
+    "torch>=2.11,<2.12",
+    "torchvision>=0.26,<0.27",
 ]
 
 tests = [
     "pytest",
+    "pytest-asyncio",
+    "pytest-mock",
+    "httpx",
 ]
 
+
 # --- PyTorch index configuration ---
-# torch is a transitive dependency (via lightning, lerobot) that defaults to
-# PyPI's fat CUDA wheel on Linux. Source routing here directs uv to fetch
-# torch/torchvision from the correct hardware-specific PyTorch index.
-# This must be declared in the consumer project because uv does not
+# torch/torchvision are transitive dependencies of the base install via lerobot
+# and lightning (installed by default via physicalai-train). They are present
+# on every node, so the cpu/cuda/xpu extras below are always required: they
+# are the only mechanism that pins torch/torchvision to the correct
+# hardware-specific PyTorch index. Without selecting one, torch defaults
+# to the wrong wheel (e.g. the fat CUDA wheel on Linux, or a `+xpu` build from the
+# non-explicit XPU index), e.g. `--extra cuda`.
+# Source routing must be declared in the consumer project because uv does not
 # propagate [tool.uv.sources] from path dependencies (uv #14675).
 #
 # PyPI is listed first as a named default index so that it takes priority
@@ -106,6 +124,7 @@ explicit = false
 
 [tool.uv.sources]
 physicalai-train = { path = "../../library", editable = true }
+physicalai = { git = "https://github.com/openvinotoolkit/physicalai.git", rev = "de49e1fda4e38e0a5342b0a59a4cad11a1ee8de0" }
 # Keep torchao on PyPI for all extras.
 # The XPU index publishes `torchao` local-version wheels (e.g. `+xpu`) that can
 # be selected via unsafe-best-match even for non-XPU installs (like `--extra cuda`),
@@ -121,7 +140,8 @@ torchvision = [
     { index = "pytorch-cu128", extra = "cuda" },
     { index = "pytorch-xpu", extra = "xpu" },
 ]
-pytorch-triton-xpu = [{ index = "pytorch-xpu", extra = "xpu" }]
+# torch's XPU build depends on triton-xpu transitively; pin its index.
+triton-xpu = { index = "pytorch-xpu" }
 
 [dependency-groups]
 dev = [
@@ -146,9 +166,10 @@ all = [
 package = true
 default-groups = ["all"]
 exclude-newer = "7 days"
-exclude-newer-package = { physicalai = false }
+# FIXME: lightning: disable cutoff so the CVE-2026-58659 fix (2.6.6) resolves despite being <7 days old
+exclude-newer-package = {pyrealsense2 = "1 days", markupsafe = false, physicalai-rebot-b601-plugin = false, physicalai-stararm-plugin = false, physicalai-bimanual-so101-plugin = false, physicalai-lerobot-plugin = false, physicalai-studio-plugin = false, lightning = false}
 # The pytorch-xpu index is non-explicit (explicit = false) because
-# transitive deps like pytorch-triton-xpu only exist on the XPU index.
+# transitive deps like triton-xpu only exist on the XPU index.
 # unsafe-best-match is required because PyTorch indexes can host stale
 # copies of common packages; best-match avoids index-order shadowing.
 #
@@ -163,6 +184,8 @@ override-dependencies = [
     "pytest>=9.0.3",
     # lerobot==0.5.1 caps diffusers at <0.36.0, 0.38.0 contains CVE-2026-44827 fix
     "diffusers>=0.38.0",
+    # LeRobot pulls in setuptools with no upper bound; 83.0.0 fixes CVE-2026-59890
+    "setuptools>=83.0.0",
 ]
 conflicts = [
     [
@@ -237,6 +260,8 @@ replace-imports-with-any = ["trossen_arm"]
 addopts = ["--strict-markers", "--strict-config", "--showlocals", "-ra"]
 testpaths = "tests"
 pythonpath = "src"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "requires_download: marks tests that require downloading external datasets",

@@ -1,12 +1,14 @@
 from collections.abc import Callable
 from uuid import UUID
 
+from loguru import logger
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio.session import AsyncSession
 
 from db.schema import EnvironmentCameraDB, EnvironmentRobotDB, ProjectEnvironmentDB
 from repositories.base import ProjectBaseRepository
 from repositories.mappers import ProjectCameraMapper, ProjectEnvironmentMapper, ProjectRobotMapper
+from robots.catalog.registry import RobotCatalogRegistry
 from schemas.environment import (
     Environment,
     EnvironmentWithRelations,
@@ -17,8 +19,9 @@ from schemas.environment import (
 
 
 class ProjectEnvironmentRepository(ProjectBaseRepository[Environment, ProjectEnvironmentDB]):
-    def __init__(self, db: AsyncSession, project_id: UUID):
+    def __init__(self, db: AsyncSession, project_id: UUID, catalog_registry: RobotCatalogRegistry):
         super().__init__(db, project_id, ProjectEnvironmentDB)
+        self.catalog_registry = catalog_registry
 
     @property
     def to_schema(self) -> Callable[[Environment], ProjectEnvironmentDB]:
@@ -70,29 +73,70 @@ class ProjectEnvironmentRepository(ProjectBaseRepository[Environment, ProjectEnv
         if env is None:
             return None
 
-        cameras = [ProjectCameraMapper.from_schema(link.camera) for link in env.camera_links]
+        cameras = []
+        for link in env.camera_links:
+            if link.camera is None:
+                logger.warning(
+                    "Environment {} references missing camera {}. Skipping dangling camera link.",
+                    env.id,
+                    link.camera_id,
+                )
+                continue
+            cameras.append(ProjectCameraMapper.from_schema(link.camera))
 
         return EnvironmentWithRelations(
             id=env.id,
             name=env.name,
-            robots=self._build_robots_with_teleoperators(env.robot_links),
+            robots=self._build_robots_with_teleoperators(env.id, env.robot_links),
             cameras=cameras,
             created_at=env.created_at,
             updated_at=env.updated_at,
         )
 
-    @staticmethod
-    def _build_robots_with_teleoperators(robot_links: list[EnvironmentRobotDB]) -> list[RobotWithTeleoperator]:
+    def _build_robots_with_teleoperators(
+        self,
+        environment_id: UUID,
+        robot_links: list[EnvironmentRobotDB],
+    ) -> list[RobotWithTeleoperator]:
         """Construct the list of robots with their eager-loaded teleoperators."""
         robots_with_teleoperators = []
         for link in robot_links:
-            robot = ProjectRobotMapper.from_schema(link.robot)
-
-            if link.tele_operator_type == "robot" and link.tele_operator_robot is not None:
-                tele_operator = TeleoperatorRobotWithRobot(
-                    robot_id=UUID(link.tele_operator_robot_id),
-                    robot=ProjectRobotMapper.from_schema(link.tele_operator_robot),
+            if link.robot is None:
+                logger.warning(
+                    "Environment {} references missing robot {}. Skipping dangling robot link.",
+                    environment_id,
+                    link.robot_id,
                 )
+                continue
+
+            robot = ProjectRobotMapper.from_schema(link.robot, self.catalog_registry)
+
+            if link.tele_operator_type == "robot" and link.tele_operator_robot_id is not None:
+                if link.tele_operator_robot is None:
+                    logger.warning(
+                        "Environment {} references missing teleoperator robot {} for robot {}. "
+                        "Returning teleoperator without eager-loaded robot.",
+                        environment_id,
+                        link.tele_operator_robot_id,
+                        link.robot_id,
+                    )
+                    tele_operator = TeleoperatorRobotWithRobot(
+                        robot_id=UUID(link.tele_operator_robot_id),
+                        robot=None,
+                    )
+                else:
+                    tele_operator = TeleoperatorRobotWithRobot(
+                        robot_id=UUID(link.tele_operator_robot_id),
+                        robot=ProjectRobotMapper.from_schema(link.tele_operator_robot, self.catalog_registry),
+                    )
+            elif link.tele_operator_type == "robot":
+                logger.warning(
+                    "Environment {} has robot link {} with tele_operator_type=robot but no tele_operator_robot_id. "
+                    "Falling back to no teleoperator.",
+                    environment_id,
+                    link.robot_id,
+                )
+                tele_operator = TeleoperatorNoneWithRobot()
             else:
                 tele_operator = TeleoperatorNoneWithRobot()
 

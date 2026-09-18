@@ -18,12 +18,13 @@ import numpy as np
 import pytest
 import torch
 
-from physicalai.data.observation import Observation
+from physicalai.data.observation import PREV_CHUNK_LEFT_OVER, Observation
 from physicalai.export.backends import TorchExportParameters
 from physicalai.export.mixin_policy import ExportBackend
 from physicalai.inference.adapters import get_adapter
 from physicalai.inference.adapters.executorch import ExecuTorchAdapter
 from physicalai.inference.adapters.pytorch import TorchAdapter
+from physicalai.policies.mixins.rtc import RTCPolicyMixin
 
 
 class TestGetAdapter:
@@ -41,7 +42,7 @@ class TestTorchAdapter:
     """Test Torch inference adapter."""
 
     @staticmethod
-    def _write_policy_manifest(tmp_path: Path) -> Path:
+    def _write_policy_manifest(tmp_path: Path, input_feature_names: list[str] | None = None) -> Path:
         model_path = tmp_path / "model.pt"
         manifest_path = tmp_path / "manifest.json"
         model_path.touch()
@@ -51,6 +52,15 @@ class TestTorchAdapter:
             "policy": {
                 "name": "act",
                 "source": {"class_path": "physicalai.policies.act.ACT"},
+            },
+            "model": {
+                "input_features": [
+                    {
+                        "class_path": "physicalai.inference.data.features.InferenceFeature",
+                        "init_args": {"name": name},
+                    }
+                    for name in input_feature_names or []
+                ],
             },
         }
         with manifest_path.open("w") as f:
@@ -210,6 +220,22 @@ class TestTorchAdapter:
 
         assert adapter.input_names == []
         assert adapter.output_names == []
+
+    def test_compile_model_passed_to_load_from_checkpoint(self, tmp_path: Path) -> None:
+        """Test compile_model flag is forwarded to load_from_checkpoint()."""
+        model_path = self._write_policy_manifest(tmp_path)
+
+        mock_model = MagicMock()
+        mock_model.eval.return_value = mock_model
+        mock_model.to.return_value = mock_model
+        mock_model.extra_export_args = {"torch": TorchExportParameters()}
+
+        with patch("physicalai.policies.act.ACT.load_from_checkpoint", return_value=mock_model) as mock_load:
+            adapter = TorchAdapter(device="cpu", compile_model=True)
+            assert adapter.compile_model is True
+
+            adapter.load(model_path)
+            assert mock_load.call_args.kwargs["compile_model"] is True
 
 
 class TestExecuTorchAdapter:

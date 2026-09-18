@@ -4,20 +4,7 @@
 ARG PYTHON_VERSION=3.13
 
 # ===========================================================================
-# Stage 1: Clone Geti UI packages and URDF robot models
-# ===========================================================================
-FROM node:24-alpine3.22@sha256:191c9f0080fcbbc6547a85dc0ff7988072214a355aabdc1d2ec55a7dae5eea8a AS ui-packages
-
-WORKDIR /home/app/web_ui/
-RUN apk add --no-cache git
-COPY --link ./application/ui/package.json ./
-
-# Clone URDF files
-RUN npm run clone-so101
-RUN npm run clone-widowx
-
-# ===========================================================================
-# Stage 2: Build Web UI
+# Stage 1: Build Web UI
 # ===========================================================================
 FROM node:24-alpine3.22@sha256:191c9f0080fcbbc6547a85dc0ff7988072214a355aabdc1d2ec55a7dae5eea8a AS web-ui
 
@@ -25,7 +12,6 @@ WORKDIR /home/app/web_ui/
 
 COPY --link application/ui/package.json ./
 COPY --link application/ui/package-lock.json ./
-COPY --from=ui-packages /home/app/web_ui/public/ /home/app/web_ui/public/
 RUN npm ci --audit=false --ignore-scripts
 
 COPY --link application/ui/tsconfig.base.json ./
@@ -53,6 +39,7 @@ COPY --link application/README.md /app/application/README.md
 
 # Backend source, entrypoint, manifests, and build hook
 COPY --link application/backend/src /app/application/backend/src
+COPY --link application/backend/scripts /app/application/backend/scripts
 COPY --link application/backend/pyproject.toml application/backend/uv.lock \
     /app/application/backend/
 COPY --link application/backend/README.md /app/application/backend/README.md
@@ -71,7 +58,7 @@ COPY --link --from=web-ui /home/app/web_ui/dist /app/application/ui/dist
 # This separation ensures that source-only changes do not invalidate
 # the expensive uv sync layers in the device-specific builders below.
 # ===========================================================================
-FROM python:${PYTHON_VERSION}-slim@sha256:eb43ff125d8d58d7449dcba7d336c23bcac412f526d861db493b9994d8010280 AS builder-base
+FROM python:${PYTHON_VERSION}-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285 AS builder-base
 
 COPY --from=docker.io/astral/uv:0.10.4@sha256:4cac394b6b72846f8a85a7a0e577c6d61d4e17fe2ccee65d9451a8b3c9efb4ac /uv /uvx /bin/
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=0
@@ -160,17 +147,6 @@ RUN uv pip uninstall --python .venv/bin/python \
     pytest-rerunfailures \
     expecttest hypothesis sortedcontainers kgb parameterized
 
-# Remove redundant for XPU container image Triton GPU backends (NVIDIA and AMD) 
-# that also contains non-redistributable files
-# Based on: https://docs.nvidia.com/cuda/eula/index.html
-RUN set -eu; \
-    CLEANUP_ROOT="$(.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"; \
-    [ -n "$CLEANUP_ROOT" ] && [ -d "$CLEANUP_ROOT" ]; \
-    find "$CLEANUP_ROOT" -type d -path "*/triton/backends/nvidia" \
-        -exec rm -rf {} + 2>/dev/null || true; \
-    find "$CLEANUP_ROOT" -type d -path "*/triton/backends/amd" \
-        -exec rm -rf {} + 2>/dev/null || true
-
 # ===========================================================================
 # Stage 4c: CUDA builder
 # ===========================================================================
@@ -189,13 +165,27 @@ RUN uv pip uninstall --python .venv/bin/python \
     expecttest hypothesis sortedcontainers kgb parameterized
 
 # ===========================================================================
+# Stage 4d: Robot assets builder
+#
+# Sync backend-owned robot assets once so all runtime targets can copy the
+# exact same files before the backend wheel install step.
+# ===========================================================================
+FROM builder-base AS robot-assets
+
+COPY --link --from=app-source /app/application/backend/src /app/application/backend/src
+
+RUN PYTHONPATH=/app/application/backend/src \
+    /app/application/backend/.venv/bin/python -c \
+    "from robots.catalog.sync_robot_assets import sync_robot_assets; sync_robot_assets()"
+
+# ===========================================================================
 # Stage 5: Runtime base — shared across all hardware targets
 #
 # Provides the non-root user, common runtime libraries, environment
 # variables, and directory structure. Healthcheck is defined in
 # docker-compose.yaml (not here) so it can reference runtime PORT.
 # ===========================================================================
-FROM python:${PYTHON_VERSION}-slim@sha256:eb43ff125d8d58d7449dcba7d336c23bcac412f526d861db493b9994d8010280 AS runtime-base
+FROM python:${PYTHON_VERSION}-slim@sha256:9d2e5553305c7c7b0097999bb17187c69b921ccd6bc9d40e4bb5ebe652c00285 AS runtime-base
 
 # uv is needed at runtime for `uv run` in run.sh
 COPY --from=docker.io/astral/uv:0.10.4@sha256:4cac394b6b72846f8a85a7a0e577c6d61d4e17fe2ccee65d9451a8b3c9efb4ac /uv /uvx /bin/
@@ -213,6 +203,7 @@ RUN groupadd --gid "${APP_GID}" appuser \
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         ffmpeg \
+        git \
         libgl1 \
         libglib2.0-0 \
         libusb-1.0-0 \
@@ -229,7 +220,7 @@ WORKDIR /app
 # /home/appuser/.cache must be pre-created so that bind mounts for
 # subdirectories (e.g. huggingface calibration) don't cause Docker
 # to create .cache as root, which blocks uv from writing its cache.
-RUN mkdir -p /app/data /app/storage /app/tmp /home/appuser/.cache/huggingface \
+RUN mkdir -p /app/storage /app/tmp /home/appuser/.cache/huggingface \
     && chown -R "${APP_UID}:${APP_GID}" /app /home/appuser/.cache
 
 # Environment configuration
@@ -239,7 +230,9 @@ ENV PATH="/app/application/backend/.venv/bin:$PATH" \
     PYTHONFAULTHANDLER=1 \
     CC=/usr/bin/gcc \
     CXX=/usr/bin/g++ \
+    SYNC=false \
     UV_NO_SYNC=1 \
+    HOST="0.0.0.0" \
     STATIC_FILES_DIR="/app/application/ui/dist/" \
     STORAGE_DIR="/app/storage" \
     AUTO_MIGRATE_STORAGE_DIR="true" \
@@ -264,6 +257,8 @@ ARG APP_GID=1000
 COPY --link --from=builder-cpu --chown=${APP_UID}:${APP_GID} \
     /app/application/backend/.venv /app/application/backend/.venv
 COPY --link --from=app-source --chown=${APP_UID}:${APP_GID} /app /app
+COPY --link --from=robot-assets --chown=${APP_UID}:${APP_GID} \
+    /app/application/backend/src/static/robot-assets /app/application/backend/src/static/robot-assets
 RUN uv pip install --python /app/application/backend/.venv/bin/python --no-deps /app/application/backend
 
 WORKDIR /app/application/backend
@@ -317,6 +312,8 @@ ARG APP_GID=1000
 COPY --link --from=builder-xpu --chown=${APP_UID}:${APP_GID} \
     /app/application/backend/.venv /app/application/backend/.venv
 COPY --link --from=app-source --chown=${APP_UID}:${APP_GID} /app /app
+COPY --link --from=robot-assets --chown=${APP_UID}:${APP_GID} \
+    /app/application/backend/src/static/robot-assets /app/application/backend/src/static/robot-assets
 RUN uv pip install --python /app/application/backend/.venv/bin/python --no-deps /app/application/backend
 
 WORKDIR /app/application/backend
@@ -336,44 +333,18 @@ FROM runtime-base AS runtime-cuda
 # Debian 13's sqv GPG verifier cannot validate the NVIDIA signing key.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-RUN echo "deb [arch=amd64 trusted=yes] https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64 /" \
-        > /etc/apt/sources.list.d/nvidia-cuda.list \
-    && apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg gpgv \
+    && curl -fsSL \
+        https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb \
+        -o /tmp/cuda-keyring.deb \
+    && dpkg -i /tmp/cuda-keyring.deb \
+    && rm -f /tmp/cuda-keyring.deb \
+    && apt-get update -o APT::Key::GPGVCommand=/usr/bin/gpgv && apt-get install -y --no-install-recommends \
         cuda-cudart-12-8=12.8.90-1 \
         libcublas-12-8=12.8.4.1-1 \
         libcudnn9-cuda-12=9.19.0.56-1 \
     && rm -rf /var/lib/apt/lists/*
-
 SHELL ["/bin/sh", "-c"]
-
-# ---------------------------------------------------------------------------
-# EULA compliance cleanup — remove non-redistributable CUDA system components.
-# Keeps only the runtime shared libraries needed for inference.
-# Based on: https://docs.nvidia.com/cuda/eula/index.html
-# ---------------------------------------------------------------------------
-RUN set -eux; \
-    # Remove development tools (compilers, debuggers, profilers)
-    apt-get remove -y --allow-remove-essential \
-        cuda-compiler-12-8 cuda-cudart-dev-12-8 cuda-nvcc-12-8 \
-        cuda-gdb-12-8 cuda-nsight-12-8 cuda-nsight-compute-12-8 \
-        cuda-nsight-systems-12-8 || true; \
-    # Remove headers and static libraries
-    find /usr/local/cuda* /usr/lib/x86_64-linux-gnu/ \
-        \( -path '*/include' -o -path '*/headers' \) -type d \
-        -exec rm -rf {} + 2>/dev/null || true; \
-    # Keep system static archives (e.g. libc_nonshared.a) required by
-    # torch.compile/Triton runtime linking; remove only CUDA static libs.
-    find /usr/local/cuda* \
-        -name '*.a' -delete 2>/dev/null || true; \
-    # Remove documentation and samples
-    rm -rf /usr/local/cuda*/doc /usr/local/cuda*/samples \
-           /usr/local/cuda*/extras/demo_suite; \
-    # Remove CUPTI profiling libraries (non-redistributable)
-    rm -rf /usr/local/cuda*/extras/CUPTI; \
-    # Remove cuSolver multi-GPU component (requires separate license)
-    find /usr/lib/x86_64-linux-gnu/ -name 'libcusolverMg*' -delete 2>/dev/null || true; \
-    # Clean up
-    apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
 FROM runtime-cuda AS physical-ai-studio-cuda
 
@@ -389,8 +360,52 @@ ARG APP_GID=1000
 COPY --link --from=builder-cuda --chown=${APP_UID}:${APP_GID} \
     /app/application/backend/.venv /app/application/backend/.venv
 COPY --link --from=app-source --chown=${APP_UID}:${APP_GID} /app /app
+COPY --link --from=robot-assets --chown=${APP_UID}:${APP_GID} \
+    /app/application/backend/src/static/robot-assets /app/application/backend/src/static/robot-assets
 RUN uv pip install --python /app/application/backend/.venv/bin/python --no-deps /app/application/backend
 
 WORKDIR /app/application/backend
 USER appuser
 CMD ["./run.sh"]
+
+# Dedicated redistributable targets. The original targets above intentionally
+# retain the complete dependency and CUDA toolkit contents.
+FROM physical-ai-studio-cpu AS physical-ai-studio-cpu-redistributable
+USER root
+RUN set -eu; \
+    CLEANUP_ROOT="$(/app/application/backend/.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"; \
+    find "$CLEANUP_ROOT" -type d \( -path "*/triton/backends/nvidia" -o -path "*/triton/backends/amd" \) \
+        -exec rm -rf {} + 2>/dev/null || true
+USER appuser
+
+FROM physical-ai-studio-xpu AS physical-ai-studio-xpu-redistributable
+USER root
+RUN set -eu; \
+    CLEANUP_ROOT="$(/app/application/backend/.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"; \
+    find "$CLEANUP_ROOT" -type d \( -path "*/triton/backends/nvidia" -o -path "*/triton/backends/amd" \) \
+        -exec rm -rf {} + 2>/dev/null || true
+USER appuser
+
+FROM physical-ai-studio-cuda AS physical-ai-studio-cuda-redistributable
+USER root
+RUN set -eux; \
+    CLEANUP_ROOT="$(/app/application/backend/.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"; \
+    find "$CLEANUP_ROOT" -type d -path "*/triton/backends/amd" \
+        -exec rm -rf {} + 2>/dev/null || true; \
+    find "$CLEANUP_ROOT" -type f \( \
+        -path "*/triton/backends/nvidia/bin/cuobjdump" -o \
+        -path "*/triton/backends/nvidia/bin/nvdisasm" \) \
+        -delete 2>/dev/null || true; \
+    apt-get remove -y --allow-remove-essential \
+        cuda-compiler-12-8 cuda-cudart-dev-12-8 cuda-nvcc-12-8 \
+        cuda-gdb-12-8 cuda-nsight-12-8 cuda-nsight-compute-12-8 \
+        cuda-nsight-systems-12-8 || true; \
+    find /usr/local/cuda* /usr/lib/x86_64-linux-gnu/ \
+        \( -path '*/include' -o -path '*/headers' \) -type d \
+        -exec rm -rf {} + 2>/dev/null || true; \
+    find /usr/local/cuda* -name '*.a' -delete 2>/dev/null || true; \
+    rm -rf /usr/local/cuda*/doc /usr/local/cuda*/samples \
+           /usr/local/cuda*/extras/demo_suite /usr/local/cuda*/extras/CUPTI; \
+    find /usr/lib/x86_64-linux-gnu/ -name 'libcusolverMg*' -delete 2>/dev/null || true; \
+    apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+USER appuser

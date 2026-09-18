@@ -17,9 +17,19 @@ import torch.nn.functional as F  # noqa: N812
 from torch import Tensor, nn
 from transformers.cache_utils import DynamicCache
 
-from physicalai.data.constants import IMAGE_MASKS, TOKENIZED_PROMPT, TOKENIZED_PROMPT_MASK
-from physicalai.data.observation import ACTION, IMAGES
+from physicalai.data.constants import (
+    IMAGE_MASKS,
+    RTC_EXECUTION_HORIZON,
+    RTC_INFERENCE_DELAY,
+    RTC_MAX_GUIDANCE_WEIGHT,
+    TOKENIZED_PROMPT,
+    TOKENIZED_PROMPT_MASK,
+)
+from physicalai.data.observation import ACTION, IMAGES, PREV_CHUNK_LEFT_OVER
 from physicalai.policies.base import Model
+from physicalai.policies.mixins import RTCModelMixin, SnapFlowModelMixin
+from physicalai.policies.mixins.peft import PeftModelMixin
+from physicalai.policies.utils import in_episode_bound, reduce_losses
 
 from .pi_gemma import (
     PaliGemmaForConditionalGenerationWithPiGemma,
@@ -329,17 +339,19 @@ class PaliGemmaWithExpertModel(nn.Module):
         vlm_config_hf.vision_config.dtype = "float32"
 
         action_expert_config_hf = CONFIG_MAPPING["gemma"](
-            head_dim=action_expert_config.head_dim,
-            hidden_size=action_expert_config.width,
-            intermediate_size=action_expert_config.mlp_dim,
-            num_attention_heads=action_expert_config.num_heads,
-            num_hidden_layers=action_expert_config.depth,
-            num_key_value_heads=action_expert_config.num_kv_heads,
-            vocab_size=257152,
-            hidden_activation="gelu_pytorch_tanh",
+            head_dim=action_expert_config.head_dim,  # pyrefly: ignore[unexpected-keyword]
+            hidden_size=action_expert_config.width,  # pyrefly: ignore[unexpected-keyword]
+            intermediate_size=action_expert_config.mlp_dim,  # pyrefly: ignore[unexpected-keyword]
+            num_attention_heads=action_expert_config.num_heads,  # pyrefly: ignore[unexpected-keyword]
+            num_hidden_layers=action_expert_config.depth,  # pyrefly: ignore[unexpected-keyword]
+            num_key_value_heads=action_expert_config.num_kv_heads,  # pyrefly: ignore[unexpected-keyword]
+            vocab_size=257152,  # pyrefly: ignore[unexpected-keyword]
+            hidden_act="gelu_pytorch_tanh",  # pyrefly: ignore[unexpected-keyword]
             dtype="float32",
-            use_adarms=use_adarms[1],
-            adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
+            use_adarms=use_adarms[1],  # pyrefly: ignore[unexpected-keyword]
+            adarms_cond_dim=action_expert_config.width  # pyrefly: ignore[unexpected-keyword]
+            if use_adarms[1]
+            else None,
         )
 
         self.paligemma = PaliGemmaForConditionalGenerationWithPiGemma(
@@ -412,9 +424,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         image_outputs = self.paligemma.model.get_image_features(image)
         if not isinstance(image_outputs, torch.Tensor):
             image_outputs = image_outputs.pooler_output
-        features = (
-            image_outputs * self.paligemma.config.text_config.hidden_size**0.5  # pyrefly: ignore[missing-attribute]
-        )
+        features = image_outputs
         if features.dtype != out_dtype:
             features = features.to(out_dtype)
         return features
@@ -425,7 +435,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         Returns:
             Language token embedding tensor.
         """
-        return self.paligemma.model.language_model.embed_tokens(tokens)
+        return self.paligemma.model.language_model.get_input_embeddings()(tokens)
 
     def forward(
         self,
@@ -536,12 +546,52 @@ class PaliGemmaWithExpertModel(nn.Module):
         return [prefix_output, suffix_output], prefix_past_key_values
 
 
-class Pi05Model(Model):
+class Pi05Model(PeftModelMixin, SnapFlowModelMixin, RTCModelMixin, Model):
     """Core Pi05 PyTorch model for flow matching VLA.
 
     This is the nn.Module that contains the actual model logic,
     separated from the Lightning wrapper.
     """
+
+    @classmethod
+    def get_default_peft_targets(cls) -> str:
+        """Return the default LoRA target modules for Pi05.
+
+        Targets the full attention block (`q`/`k`/`v`/`o_proj`) and MLP (`gate`/`up`/
+        `down_proj`) of *both* the action expert and the PaliGemma VLM's language model,
+        plus the action/time projection heads.
+
+        Two design choices drive this, deliberately going wider than a q/v-attention-only,
+        action-expert-only adapter set:
+
+        1. VLM coverage: adapting only the action expert starves LoRA of the same "the VLM
+           needs to adapt too" signal that full fine-tuning relies on (see
+           `freeze_vision_encoder`/`train_expert_only`, which default to training the whole
+           VLM) -- important when the task requires new visual/language groundings, not
+           just new action-space mappings.
+        2. Full attention + MLP: the original LoRA paper's own ablation (Hu et al. 2021,
+           Table 6) found that spreading a fixed parameter budget across more weight-matrix
+           types at lower rank outperforms concentrating it in fewer types at higher rank
+           (e.g. adapting {q,k,v,o} at rank 4 beat {q,v} alone at rank 16). MLP matrices
+           also hold the bulk of a transformer block's parameters, so q/v-only attention
+           adaptation touches a disproportionately small slice of model capacity. Note that
+           with `num_kv_heads=1` (GQA) in these Gemma variants, `k_proj`/`v_proj` are cheap
+           to adapt (output dim is just `head_dim`), so the "full attention" addition here
+           is mostly `q_proj`/`o_proj` plus MLP.
+
+        The vision tower (SigLIP backbone) is still excluded by default; pass an explicit
+        `lora_target_modules` to include it if needed. Excludes the SnapFlow-only
+        `target_time_mlp_*` heads.
+
+        Returns:
+            A regex string matching the default LoRA-adapted submodule names.
+        """
+        attn_and_mlp = r"(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)"
+        return (
+            rf"(.*\.gemma_expert\..*\.{attn_and_mlp}|"
+            rf".*\.paligemma\.model\.language_model\..*\.{attn_and_mlp}|"
+            r"(action_in_proj|action_out_proj|time_mlp_in|time_mlp_out))"
+        )
 
     def __init__(  # noqa: PLR0913
         self,
@@ -560,12 +610,17 @@ class Pi05Model(Model):
         time_sampling_offset: float = 0.001,
         min_period: float = 4e-3,
         max_period: float = 4.0,
+        snapflow_enabled: bool = False,
+        snapflow_alpha: float = 0.5,
+        snapflow_lambda: float = 1.0,
+        snapflow_num_inference_steps: int = 1,
         image_resolution: tuple[int, int] = (224, 224),
         tokenizer_max_length: int = 200,
         freeze_vision_encoder: bool = False,
         train_expert_only: bool = True,
         gradient_checkpointing: bool = False,
         compile_model: bool = False,
+        compile_mode: str = "max-autotune",
         use_random_input_noise: bool = False,
     ) -> None:
         """Initialize Pi05Model.
@@ -586,12 +641,19 @@ class Pi05Model(Model):
             time_sampling_offset: Offset for time sampling.
             min_period: Minimum period for sine-cosine positional encoding.
             max_period: Maximum period for sine-cosine positional encoding.
+            snapflow_enabled: Whether to enable SnapFlow self-distillation during training.
+            snapflow_alpha: Probability of replacing flow-matching loss with SnapFlow
+                consistency loss on each training step.
+            snapflow_lambda: Weight multiplier for the SnapFlow consistency loss term.
+            snapflow_num_inference_steps: Number of Euler steps used during SnapFlow
+                inference at test time.
             image_resolution: Target image resolution (height, width). Must be square.
             tokenizer_max_length: Maximum token length for the tokenizer.
             freeze_vision_encoder: Whether to freeze the vision encoder during training.
             train_expert_only: Whether to train only the action expert.
             gradient_checkpointing: Whether to enable gradient checkpointing for memory optimization.
             compile_model: Whether to use torch.compile.
+            compile_mode: Torch compile mode (e.g. "default", "max-autotune").
             use_random_input_noise: Whether to use random noise as the initial input for the denoising
                 process during inference. If False, zeros are used instead.
 
@@ -613,6 +675,12 @@ class Pi05Model(Model):
         self._image_resolution = image_resolution
         self._tokenizer_max_length = tokenizer_max_length
         self._use_random_input_noise = use_random_input_noise
+        self.init_snapflow_state(
+            enabled=snapflow_enabled,
+            alpha=snapflow_alpha,
+            lambda_=snapflow_lambda,
+            num_inference_steps=snapflow_num_inference_steps,
+        )
 
         paligemma_config = get_gemma_config(paligemma_variant)
         action_expert_config = get_gemma_config(action_expert_variant)
@@ -636,8 +704,10 @@ class Pi05Model(Model):
 
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
-
-        self.enable_rtc = False
+        self.target_time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
+        self.target_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+        nn.init.zeros_(self.target_time_mlp_out.weight)
+        nn.init.zeros_(self.target_time_mlp_out.bias)
 
         self.gradient_checkpointing_enabled = False
         if gradient_checkpointing:
@@ -645,9 +715,6 @@ class Pi05Model(Model):
 
         if compile_model:
             torch.set_float32_matmul_precision("high")
-            # TODO(Eugene): max-autotune currently failed.  # noqa: TD003, FIX002
-            # Set to default for now, need further investigation.
-            compile_mode = "default"
             self.sample_actions = torch.compile(self.sample_actions, mode=compile_mode)  # type: ignore[method-assign]
             self.forward = torch.compile(self.forward, mode=compile_mode)  # type: ignore[method-assign]
 
@@ -824,8 +891,7 @@ class Pi05Model(Model):
             att_masks += [0] * num_img_embs
 
         def lang_embed_func(tokens: Tensor) -> Tensor:
-            lang_emb = self.paligemma_with_expert.embed_language_tokens(tokens)
-            return lang_emb * math.sqrt(lang_emb.shape[-1])
+            return self.paligemma_with_expert.embed_language_tokens(tokens)
 
         lang_emb = lang_embed_func(tokens) if use_batched else self._apply_checkpoint(lang_embed_func, tokens)
 
@@ -844,6 +910,7 @@ class Pi05Model(Model):
         self,
         noisy_actions: Tensor,
         timestep: Tensor,
+        target_time: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Embed noisy_actions and timestep for Expert Gemma processing.
 
@@ -875,6 +942,23 @@ class Pi05Model(Model):
             return F.silu(x)
 
         time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
+        if target_time is not None and self._snapflow_enabled:
+            target_time_emb = _create_sinusoidal_pos_embedding(
+                target_time,
+                self.action_in_proj.out_features,
+                min_period=self._min_period,
+                max_period=self._max_period,
+                device=target_time.device,
+            )
+            target_time_emb = target_time_emb.type(dtype=timestep.dtype)
+
+            def target_time_mlp_func(emb: Tensor) -> Tensor:
+                x = self.target_time_mlp_in(emb)
+                x = F.silu(x)
+                return self.target_time_mlp_out(x)
+
+            target_time_emb = self._apply_checkpoint(target_time_mlp_func, target_time_emb)
+            time_emb += target_time_emb
         action_time_emb = action_emb
         adarms_cond = time_emb
 
@@ -892,79 +976,33 @@ class Pi05Model(Model):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(
+    def _predict_velocity(
         self,
-        batch: dict[str, Any],
-    ) -> tuple[Tensor, dict[str, float]] | Tensor:
-        """Forward pass through the model.
+        x_t: Tensor,
+        timestep: Tensor,
+        target_time: Tensor,
+        prefix_embs: Tensor,
+        prefix_pad_masks: Tensor,
+        prefix_att_masks: Tensor,
+    ) -> Tensor:
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            x_t,
+            timestep,
+            target_time=target_time,
+        )
 
-        Training mode: computes flow matching loss (with gradients).
-        Eval mode: returns predicted action chunk via denoising.
-
-        Args:
-            batch: Preprocessed batch dict.
-
-        Returns:
-            Training: (loss tensor, loss dict).  Eval: action tensor.
-        """
-        if self.training:
-            return self.compute_loss(batch)
-        return self.predict_action_chunk(batch)
-
-    def compute_loss(self, batch: dict[str, Any]) -> tuple[Tensor, dict[str, float]]:
-        """Compute flow matching training loss.
-
-        Delegates to :meth:`_flow_matching_loss`.
-
-        Returns:
-            Tuple of (loss tensor, loss dict with ``"loss"`` key).
-        """
-        return self._flow_matching_loss(batch)
-
-    def _flow_matching_loss(self, batch: dict[str, Any]) -> tuple[Tensor, dict[str, float]]:  # noqa: PLR0914
-        """Compute flow matching training loss.
-
-        Samples random noise and timesteps, interpolates noisy actions,
-        predicts the velocity field, and returns the MSE between predicted
-        and target velocities.  Gradient checkpointing is applied when the
-        model is in training mode.
-
-        Args:
-            batch: Preprocessed batch dict containing IMAGES, IMAGE_MASKS,
-                TOKENIZED_PROMPT, TOKENIZED_PROMPT_MASK, and ACTION.
-
-        Returns:
-            Tuple of (mean loss tensor, loss dict with ``"loss"`` key).
-        """
-        images = batch[IMAGES]
-        img_masks = batch[IMAGE_MASKS]
-        tokens = batch[TOKENIZED_PROMPT]
-        masks = batch[TOKENIZED_PROMPT_MASK]
-        actions = batch[ACTION]
-
-        noise = self.sample_noise(actions.shape, actions.device)
-        time = self.sample_time(actions.shape[0], actions.device)
-
-        time_expanded = time[:, None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
-
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
-
+        local_prefix_embs = prefix_embs
         if (
             self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
         ):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+            local_prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
-        pad_masks_combined = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks_combined = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-
-        att_2d_masks = _make_att_2d_masks(pad_masks_combined, att_masks_combined)
-        position_ids = torch.cumsum(pad_masks_combined, dim=1) - 1
-
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = _make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
         def forward_func(
@@ -984,14 +1022,23 @@ class Pi05Model(Model):
             )
             return suffix_out
 
-        suffix_out = self._apply_checkpoint(
-            forward_func,
-            prefix_embs,
-            suffix_embs,
-            att_2d_masks_4d,
-            position_ids,
-            adarms_cond,
-        )
+        if torch.is_grad_enabled():
+            suffix_out = self._apply_checkpoint(
+                forward_func,
+                local_prefix_embs,
+                suffix_embs,
+                att_2d_masks_4d,
+                position_ids,
+                adarms_cond,
+            )
+        else:
+            suffix_out = forward_func(
+                local_prefix_embs,
+                suffix_embs,
+                att_2d_masks_4d,
+                position_ids,
+                adarms_cond,
+            )
 
         suffix_out = suffix_out[:, -self._chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
@@ -999,19 +1046,113 @@ class Pi05Model(Model):
         def action_out_proj_func(suffix_out: Tensor) -> Tensor:
             return self.action_out_proj(suffix_out)
 
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        if torch.is_grad_enabled():
+            return self._apply_checkpoint(action_out_proj_func, suffix_out)
+        return action_out_proj_func(suffix_out)
 
-        losses = F.mse_loss(u_t, v_t, reduction="none")
+    def forward(
+        self,
+        batch: dict[str, Any],
+    ) -> tuple[Tensor, dict[str, Tensor | float]] | Tensor:
+        """Forward pass through the model.
+
+        Training mode: computes flow matching loss (with gradients).
+        Eval mode: returns predicted action chunk via denoising.
+
+        Args:
+            batch: Preprocessed batch dict.
+
+        Returns:
+            Training: (loss tensor, loss dict).  Eval: action tensor.
+        """
+        if self.training:
+            return self.compute_loss(batch)
+        return self.predict_action_chunk(batch)
+
+    def compute_loss(self, batch: dict[str, Any]) -> tuple[Tensor, dict[str, Tensor | float]]:
+        """Compute flow matching training loss.
+
+        Delegates to :meth:`_flow_matching_loss`.
+
+        Returns:
+            Tuple of (loss tensor, loss dict with ``"loss"`` key).
+        """
+        return self._flow_matching_loss(batch)
+
+    def _flow_matching_loss(self, batch: dict[str, Any]) -> tuple[Tensor, dict[str, Tensor | float]]:  # noqa: PLR0914
+        """Compute flow matching training loss.
+
+        Samples random noise and timesteps, interpolates noisy actions,
+        predicts the velocity field, and returns the MSE between predicted
+        and target velocities.  When SnapFlow is enabled, uses a mixture
+        of standard FM loss and consistency distillation loss.
+
+        Action steps flagged by ``extra.action_is_pad`` are excluded from both
+        the numerator and the denominator, so end-of-episode padding neither
+        supervises the policy nor scales down the gradient.
+
+        Args:
+            batch: Preprocessed batch dict containing IMAGES, IMAGE_MASKS,
+                TOKENIZED_PROMPT, TOKENIZED_PROMPT_MASK, and ACTION, and
+                optionally ``extra.action_is_pad``.
+
+        Returns:
+            Tuple of (mean loss tensor, loss dict with ``"loss"`` key).
+        """
+        images = batch[IMAGES]
+        img_masks = batch[IMAGE_MASKS]
+        tokens = batch[TOKENIZED_PROMPT]
+        masks = batch[TOKENIZED_PROMPT_MASK]
+        actions = batch[ACTION]
+
+        bsize = actions.shape[0]
+        device = actions.device
+        noise = self.sample_noise(actions.shape, device)
+        time = self.sample_time(bsize, device)
+
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
+        cd_idx: Tensor | None = None
+        if not self._snapflow_enabled:
+            v_t = self._predict_velocity(
+                x_t,
+                time,
+                time,
+                prefix_embs,
+                prefix_pad_masks,
+                prefix_att_masks,
+            )
+            losses = F.mse_loss(u_t, v_t, reduction="none")
+        else:
+            losses, cd_idx = self.snapflow_mixed_loss(
+                u_t=u_t,
+                x_t=x_t,
+                time=time,
+                actions=actions,
+                prefix_embs=prefix_embs,
+                prefix_pad_masks=prefix_pad_masks,
+                prefix_att_masks=prefix_att_masks,
+                sample_noise=self.sample_noise,
+                predict_velocity=self._predict_velocity,
+            )
+
+        # Mask out action steps that only exist because the chunk query was
+        # clamped at an episode boundary.
+        bound = in_episode_bound(batch, cd_idx)
 
         # Truncate losses to actual action dimensions to avoid dilution from padding
         original_action_dim = int(self._dataset_stats[ACTION]["shape"][-1])
         losses = losses[:, :, :original_action_dim]
 
-        loss = losses.mean()
-        return loss, {"loss": loss.item()}
+        loss = reduce_losses(losses, bound)
+        # Detached tensor, not `.item()` float: see Model.compute_loss docstring.
+        return loss, {"loss": loss.detach()}
 
     @torch.no_grad()
-    def compute_val_loss(self, batch: dict[str, Any]) -> tuple[Tensor, dict[str, float]]:
+    def compute_val_loss(self, batch: dict[str, Any]) -> tuple[Tensor, dict[str, Tensor | float]]:
         """Compute validation loss: MSE between predicted and ground-truth actions.
 
         Runs the full denoising loop (same as inference) and compares the
@@ -1019,9 +1160,14 @@ class Pi05Model(Model):
         deterministic and gives a direct measure of action prediction
         quality — unlike the stochastic flow matching training loss.
 
+        Action steps flagged by ``extra.action_is_pad`` are excluded, so the
+        metric is not diluted by the repeated terminal actions LeRobot inserts
+        at episode boundaries.
+
         Args:
             batch: Preprocessed batch dict containing IMAGES, IMAGE_MASKS,
-                TOKENIZED_PROMPT, TOKENIZED_PROMPT_MASK, and ACTION.
+                TOKENIZED_PROMPT, TOKENIZED_PROMPT_MASK, and ACTION, and
+                optionally ``extra.action_is_pad``.
 
         Returns:
             Tuple of (mean MSE loss tensor, loss dict with ``"loss"`` key).
@@ -1036,7 +1182,12 @@ class Pi05Model(Model):
 
         # Align chunk lengths (predicted may be clipped by n_action_steps)
         min_len = min(gt_trimmed.shape[1], pred_trimmed.shape[1])
-        loss = F.mse_loss(pred_trimmed[:, :min_len], gt_trimmed[:, :min_len])
+        losses = F.mse_loss(pred_trimmed[:, :min_len], gt_trimmed[:, :min_len], reduction="none")
+
+        bound = in_episode_bound(batch)
+        if bound is not None:
+            bound = bound[:, :min_len]
+        loss = reduce_losses(losses, bound)
         return loss, {"loss": loss.item()}
 
     def predict_action_chunk(self, batch: dict[str, Any]) -> Tensor:
@@ -1050,6 +1201,10 @@ class Pi05Model(Model):
 
         Returns:
             Denoised action tensor, unpadded and clipped to n_action_steps.
+
+        Raises:
+            ValueError: If RTC is enabled and the batch is missing
+                ``prev_chunk_left_over``.
         """
         images = batch[IMAGES]
         img_masks = batch[IMAGE_MASKS]
@@ -1058,11 +1213,19 @@ class Pi05Model(Model):
 
         rtc_kwargs: dict[str, Any] = {}
         if self.enable_rtc:
+            max_guidance = batch.get(RTC_MAX_GUIDANCE_WEIGHT, 0.0)
+            execution_horizon = batch.get(RTC_EXECUTION_HORIZON, 0)
+            inference_delay = batch.get(RTC_INFERENCE_DELAY, 0.0)
+
+            if PREV_CHUNK_LEFT_OVER not in batch:
+                msg = f"Expected {PREV_CHUNK_LEFT_OVER} in batch when RTC is enabled."
+                raise ValueError(msg)
+
             rtc_kwargs = {
-                "rtc_max_guidance": batch.get("max_guidance_weight", 0.0),
-                "rtc_execution_horizon": batch.get("execution_horizon", 0),
-                "rtc_latency": batch.get("inference_delay", 0.0),
-                "rtc_prev_action_chunk": batch.get("prev_chunk_left_over"),
+                "rtc_max_guidance": max_guidance,
+                "rtc_execution_horizon": execution_horizon,
+                "rtc_latency": inference_delay,
+                "rtc_prev_action_chunk": self._pad_prev_chunk(batch[PREV_CHUNK_LEFT_OVER]),
             }
 
         actions = self.sample_actions(
@@ -1084,78 +1247,6 @@ class Pi05Model(Model):
 
         return actions
 
-    def _compute_prefix_weights(
-        self,
-        inference_delay: Tensor,
-        execution_horizon: Tensor,
-        prefix_attention_schedule: Literal["linear", "exp"] = "linear",
-    ) -> Tensor:
-        """Compute prefix attention weights inside the graph.
-
-        Args:
-            inference_delay: Scalar tensor — the dynamic latency estimate.
-            execution_horizon: Scalar tensor — number of fresh actions per chunk.
-            prefix_attention_schedule: Schedule type for prefix attention weights ("linear" or "exp").
-
-        Returns:
-            ``(1, chunk_size, 1)`` weight tensor.
-        """
-        chunk_size = self._chunk_size
-        end = execution_horizon.float()
-        start = torch.minimum(inference_delay.float(), end)
-
-        idx = torch.arange(chunk_size, dtype=torch.float32, device=inference_delay.device)
-        denom = end - start + 1.0
-        weights = (end - idx) / denom
-        weights = torch.clamp(weights, min=0.0, max=1.0)
-
-        if prefix_attention_schedule == "exp":
-            weights = weights * (torch.exp(weights) - 1.0) / (math.e - 1.0)
-        # "linear" → no-op
-
-        return weights.unsqueeze(0).unsqueeze(-1)  # (1, chunk_size, 1)
-
-    @staticmethod
-    def _rtc_correct(
-        x_t: Tensor,
-        v_t: Tensor,
-        prev_chunk_left_over: Tensor,
-        prefix_weights: Tensor,
-        time: float,
-        max_guidance_weight: Tensor,
-    ) -> Tensor:
-        """Apply RTC guidance correction to velocity prediction.
-
-        Uses direct error (not autograd.grad) for OV traceability.
-
-        Returns:
-            Corrected velocity tensor.
-        """
-        tau = 1.0 - time
-
-        # Predicted clean actions at t=0
-        x1_t = x_t - time * v_t
-
-        # Weighted error between previous chunk and prediction
-        err = (prev_chunk_left_over - x1_t) * prefix_weights
-        correction = err
-
-        # Adaptive guidance weight
-        max_gw = max_guidance_weight.float()
-        tau_t = torch.as_tensor(tau)
-        squared_one_minus_tau = (1.0 - tau_t) ** 2
-        inv_r2 = (squared_one_minus_tau + tau_t**2) / squared_one_minus_tau
-
-        # Manual nan_to_num — torch.nan_to_num not supported by OV
-        c_raw = (1.0 - tau_t) / tau_t
-        c = torch.where(torch.isinf(c_raw), max_gw, c_raw)
-
-        guidance_weight_raw = c * inv_r2
-        guidance_weight = torch.where(torch.isinf(guidance_weight_raw), max_gw, guidance_weight_raw)
-        guidance_weight = torch.minimum(guidance_weight, max_gw)
-
-        return v_t - guidance_weight * correction
-
     @torch.no_grad()
     def sample_actions(  # noqa: PLR0914
         self,
@@ -1175,8 +1266,8 @@ class Pi05Model(Model):
         Returns:
             Denoised action tensor.
         """
-        if num_steps is None:
-            num_steps = self._num_inference_steps
+        default_num_steps = num_steps if num_steps is not None else self._num_inference_steps
+        num_steps = self.snapflow_num_inference_steps(default_num_steps)
 
         bsize = tokens.shape[0]
         device = tokens.device
@@ -1206,18 +1297,20 @@ class Pi05Model(Model):
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+            target_time = self.snapflow_target_time(bsize, time_tensor, device)
 
             v_t = self.denoise_step(
                 prefix_pad_masks=prefix_pad_masks,
                 past_key_values=past_key_values,
                 x_t=x_t,
                 timestep=time_tensor,
+                target_time=target_time,
             )
 
             if rtc_prev_action_chunk is not None:
                 prefix_weights = self._compute_prefix_weights(
-                    inference_delay=torch.tensor(rtc_latency, device=device),
-                    execution_horizon=torch.tensor(rtc_execution_horizon, device=device),
+                    inference_delay=torch.as_tensor(rtc_latency, device=device),
+                    execution_horizon=torch.as_tensor(rtc_execution_horizon, device=device),
                 )
                 v_t = self._rtc_correct(
                     x_t,
@@ -1225,7 +1318,7 @@ class Pi05Model(Model):
                     prev_chunk_left_over=rtc_prev_action_chunk,
                     prefix_weights=prefix_weights,
                     time=time,
-                    max_guidance_weight=torch.tensor(rtc_max_guidance, device=device),
+                    max_guidance_weight=torch.as_tensor(rtc_max_guidance, device=device),
                 )
 
             x_t += dt * v_t
@@ -1238,13 +1331,18 @@ class Pi05Model(Model):
         past_key_values: DynamicCache | None,
         x_t: Tensor,
         timestep: Tensor,
+        target_time: Tensor | None = None,
     ) -> Tensor:
         """Apply one denoising step of noise x_t at a given timestep.
 
         Returns:
             Velocity prediction tensor for this denoising step.
         """
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, timestep)
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            x_t,
+            timestep,
+            target_time=target_time,
+        )
 
         suffix_len = suffix_pad_masks.shape[1]
         batch_size = prefix_pad_masks.shape[0]

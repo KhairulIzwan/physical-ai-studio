@@ -11,6 +11,10 @@ from .model_metrics_service import ModelMetricsService
 from .model_service import ModelService
 from .project_camera_service import ProjectCameraService
 from .project_service import ProjectService
+from .project_thumbnail_service import ProjectThumbnailService
+from .remote_server_service import RemoteServerService
+from .remote_trainer_service import RemoteTrainerService
+from .robot_catalog_service import RobotCatalogService
 from .system_service import SystemService
 
 __all__ = [
@@ -25,6 +29,10 @@ __all__ = [
     "ModelService",
     "ProjectCameraService",
     "ProjectService",
+    "ProjectThumbnailService",
+    "RemoteServerService",
+    "RemoteTrainerService",
+    "RobotCatalogService",
     "RobotService",
     "SystemService",
 ]

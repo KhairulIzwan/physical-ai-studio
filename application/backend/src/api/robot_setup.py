@@ -7,7 +7,6 @@ from loguru import logger
 
 from api.dependencies import RobotConnectionManagerDep, get_project_id
 from schemas import SerialPortInfo
-from schemas.robot import RobotType
 from workers.robots.so101_setup_worker import SO101SetupWorker
 from workers.transport.websocket_transport import WebSocketTransport
 
@@ -20,8 +19,8 @@ async def robot_setup_websocket(
     robot_manager: RobotConnectionManagerDep,
     websocket: WebSocket,
     robot_type: str,
-    serial_number: str = "",
-    connection_string: str = "",
+    serial_number: str | None = None,
+    connection_string: str | None = None,
 ) -> None:
     """Establish a WebSocket connection for the SO101 robot setup wizard.
 
@@ -31,7 +30,7 @@ async def robot_setup_websocket(
         connection_string: serial port path (fallback when serial_number is unavailable)
     """
     # Validate robot type
-    if robot_type not in {RobotType.SO101_FOLLOWER, RobotType.SO101_LEADER}:
+    if robot_type not in {"SO101_Follower", "SO101_Leader"}:
         await websocket.accept()
         await websocket.send_json(
             {
@@ -43,7 +42,7 @@ async def robot_setup_websocket(
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
-    if serial_number == "" and connection_string == "":
+    if not serial_number and not connection_string:
         await websocket.accept()
         await websocket.send_json(
             {
@@ -59,8 +58,8 @@ async def robot_setup_websocket(
 
     try:
         serial_port = SerialPortInfo(
-            connection_string=connection_string or None,
-            serial_number=serial_number or None,
+            connection_string=connection_string,
+            serial_number=serial_number,
         )
         worker = SO101SetupWorker(
             transport=WebSocketTransport(websocket),

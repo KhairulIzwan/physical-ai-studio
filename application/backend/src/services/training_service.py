@@ -1,229 +1,62 @@
 import asyncio
 import multiprocessing as mp
-import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Collection
 from multiprocessing.synchronize import Event
 from queue import Empty
-from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-if TYPE_CHECKING:
-    import lightning.pytorch as pl
-from lightning.pytorch.callbacks import Callback, ProgressBar
-from lightning.pytorch.utilities.types import STEP_OUTPUT
 from loguru import logger
 
+from schemas import Job
 from schemas.base_job import JobStatus, JobType
+from schemas.job import RemoteTrainJobPayload, SshTrainJobPayload, TrainingTarget
 from services.event_processor import EventType
 from services.job_service import JobService
 from workers.base import BaseThreadWorker
 
 
-def _safe_progress(global_step: int, max_steps: int) -> int:
-    """Compute step-based training progress clamped to ``[0, 100]``.
-
-    ``trainer.max_steps`` is ``-1`` when unset (epoch-driven runs) and may be ``0``;
-    both would otherwise produce a negative value or a ``ZeroDivisionError``.
-
-    Args:
-        global_step: Current optimizer step.
-        max_steps: Configured maximum number of steps.
-
-    Returns:
-        Progress percentage in ``[0, 100]``; ``0`` when ``max_steps`` is unset.
-    """
-    if max_steps <= 0:
-        return 0
-    return min(100, max(0, round(global_step / max_steps * 100)))
-
-
-def _extract_loss(outputs: Any) -> float | None:
-    """Best-effort scalar loss from a Lightning step output.
-
-    Handles a ``{"loss": tensor}`` mapping (training) or a bare loss tensor
-    (eval-loss validation). Returns ``None`` when no scalar loss is available.
-    """
-    candidate = outputs.get("loss") if isinstance(outputs, Mapping) else outputs
-    detach = getattr(candidate, "detach", None)
-    if detach is None:
-        return None
-    try:
-        return detach().cpu().item()
-    except (RuntimeError, ValueError):
-        return None
-
-
-class ProgressCallback(ProgressBar):
-    def __init__(self, job_id: UUID):
-        super().__init__()
-        self.job_id = job_id
-
-    def on_fit_start(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:  # noqa ARG002
-        """Pre-compute total steps once training begins."""
-        self.total_steps = trainer.max_steps
-
-    def on_train_batch_end(
-        self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", outputs: STEP_OUTPUT, batch: Any, batch_idx: int
-    ) -> None:
-        super().on_train_batch_end(trainer, pl_module, outputs, batch, batch_idx)
-        progress = round((trainer.global_step) / self.total_steps * 100)
-        if progress < 100:
-            asyncio.run(JobService.update_job_status(job_id=self.job_id, status=JobStatus.RUNNING, progress=progress))
-
-
 class TrainingTrackingDispatcher(BaseThreadWorker):
-    """Dispatch events from the callback to a queue asynchronously."""
+    """Forward progress updates to the job store and event stream off the hot path.
 
-    def __init__(self, job_id: UUID, event_queue: mp.Queue, interrupt_event: Event):
+    Backends call :meth:`report` (a `ProgressReporter`) from the training thread
+    or event loop; the dispatcher thread drains the queue and performs the async
+    DB writes so training is never blocked on I/O.
+    """
+
+    def __init__(
+        self,
+        job_id: UUID,
+        event_queue: mp.Queue,
+        interrupt_event: Event,
+        update_progress: Callable[[UUID, int, str | None, dict | None], Awaitable[Job]],
+    ):
         super().__init__(stop_event=interrupt_event)
         self.job_id = job_id
         self.event_queue = event_queue
         self.queue: mp.Queue = mp.Queue()
         self.interrupt_event = interrupt_event
+        self.update_progress = update_progress
 
     async def run_loop(self) -> None:
         while not self.interrupt_event.is_set():
-            try:
-                progress, extra_info = self.queue.get_nowait()
-                job = await JobService.update_job_status(
-                    self.job_id, JobStatus.RUNNING, progress=progress, extra_info=extra_info
-                )
-                self.event_queue.put((EventType.JOB_UPDATE, job))
-            except Empty:
+            if not await self._drain_one():
                 await asyncio.sleep(0.05)
+        while await self._drain_one():
+            pass
 
-    def update_progress(self, progress: int, extra_info: dict) -> None:
-        self.queue.put((progress, extra_info))
+    async def _drain_one(self) -> bool:
+        """Apply one queued progress update. Return False when the queue is empty."""
+        try:
+            progress, message, extra_info = self.queue.get_nowait()
+        except Empty:
+            return False
+        job = await self.update_progress(self.job_id, progress, message, extra_info)
+        self.event_queue.put((EventType.JOB_UPDATE, job))
+        return True
 
-
-class TrainingTrackingCallback(Callback):
-    def __init__(
-        self,
-        shutdown_event: Event,
-        interrupt_event: Event,
-        dispatcher: TrainingTrackingDispatcher,
-    ):
-        super().__init__()
-        self.shutdown_event = shutdown_event  # global stop event in case of shutdown
-        self.interrupt_event = interrupt_event  # event for interrupting training gracefully
-        self.dispatcher = dispatcher
-        self._last_val_progress: int | None = None
-
-    def _should_stop(self, trainer: "pl.Trainer") -> None:
-        if self.shutdown_event.is_set() or self.interrupt_event.is_set():
-            trainer.should_stop = True
-
-    def on_train_batch_end(
-        self,
-        trainer: "pl.Trainer",
-        pl_module: "pl.LightningModule",  # noqa ARG002
-        outputs: STEP_OUTPUT,
-        batch: Any,  # noqa ARG002
-        batch_idx: int,  # noqa ARG002
-    ) -> None:
-        loss_val = _extract_loss(outputs)
-        progress = _safe_progress(trainer.global_step, trainer.max_steps)
-        self.dispatcher.update_progress(progress, extra_info={"train/loss_step": loss_val})
-        self._should_stop(trainer)
-
-    def on_validation_batch_end(
-        self,
-        trainer: "pl.Trainer",
-        pl_module: "pl.LightningModule",  # noqa ARG002
-        outputs: STEP_OUTPUT,  # noqa ARG002
-        batch: Any,  # noqa ARG002
-        batch_idx: int,  # noqa ARG002
-        dataloader_idx: int = 0,  # noqa ARG002
-    ) -> None:
-        """Honor interrupts during validation and refresh job progress on change.
-
-        ``global_step`` does not advance during validation, so the step-based
-        progress is constant. Dispatch only when it changes to avoid redundant
-        identical job updates.
-        """
-        progress = _safe_progress(trainer.global_step, trainer.max_steps)
-        if progress != self._last_val_progress:
-            self._last_val_progress = progress
-            self.dispatcher.update_progress(progress, extra_info={"stage": "validation"})
-        self._should_stop(trainer)
-
-
-class TrainingLogCallback(Callback):
-    """Mirror training progress/metrics to loguru as regular log lines."""
-
-    def __init__(self):
-        super().__init__()
-        self.every_n_steps = 1
-        self._val_start_t: float | None = None
-
-    def on_fit_start(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:  # noqa ARG002
-        """Resolve logging interval once trainer values are available."""
-        self.every_n_steps = self._auto_every_n_steps(trainer.max_steps)
-
-        logger.info(
-            f"Training log cadence configured: every_n_steps={self.every_n_steps}, max_steps={trainer.max_steps}"
-        )
-
-    @staticmethod
-    def _auto_every_n_steps(total_steps: int) -> int:
-        """Choose an interval that targets >=1000 logs and at least every 100 steps.
-
-        Rules:
-        - Never less frequent than every 100 steps.
-        - Aim for at least 1000 progress log entries when possible.
-        """
-        if total_steps <= 0:
-            return 1
-
-        # Log at least once every 100 steps, otherwise make sure to log 1000 times
-        return min(100, max(1, total_steps // 1000))
-
-    def on_train_batch_end(
-        self,
-        trainer: "pl.Trainer",
-        pl_module: "pl.LightningModule",  # noqa ARG002
-        outputs: STEP_OUTPUT,
-        batch: Any,  # noqa ARG002
-        batch_idx: int,  # noqa ARG002
-    ) -> None:
-        global_step = trainer.global_step
-        is_first_step = global_step <= 1
-        if not is_first_step and global_step % self.every_n_steps != 0:
-            return
-
-        loss_val = _extract_loss(outputs)
-
-        max_steps = max(1, trainer.max_steps)
-        progress = _safe_progress(trainer.global_step, trainer.max_steps)
-        logger.info(f"Training progress: step={global_step}/{max_steps} ({progress}%), train/loss_step={loss_val}")
-
-    def on_validation_start(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:  # noqa ARG002
-        """Mark the start of validation."""
-        self._val_start_t = time.monotonic()
-        logger.info(f"Validation started at step={trainer.global_step}/{max(1, trainer.max_steps)}")
-
-    def on_validation_batch_end(
-        self,
-        trainer: "pl.Trainer",  # noqa ARG002
-        pl_module: "pl.LightningModule",  # noqa ARG002
-        outputs: STEP_OUTPUT,
-        batch: Any,  # noqa ARG002
-        batch_idx: int,
-        dataloader_idx: int = 0,  # noqa ARG002
-    ) -> None:
-        current = batch_idx + 1
-        if current > 1 and current % self.every_n_steps != 0:
-            return
-        logger.info(f"Validation progress: batch={current}, val/loss_step={_extract_loss(outputs)}")
-
-    def on_validation_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:  # noqa ARG002
-        """Summarize validation with the aggregated loss and elapsed time."""
-        val_loss = trainer.callback_metrics.get("val/loss")
-        val_loss_val = val_loss.item() if val_loss is not None else None
-        elapsed = time.monotonic() - self._val_start_t if self._val_start_t is not None else 0.0
-        logger.info(
-            f"Validation finished at step={trainer.global_step}, val/loss={val_loss_val}, elapsed={elapsed:.1f}s"
-        )
+    def report(self, progress: int, *, message: str | None = None, extra_info: dict | None = None) -> None:
+        """`ProgressReporter`-compatible entry point used by training backends."""
+        self.queue.put((progress, message, extra_info))
 
 
 class TrainingService:
@@ -239,19 +72,75 @@ class TrainingService:
     """
 
     @staticmethod
-    async def abort_orphan_jobs() -> None:
+    async def abort_orphan_jobs(job_service: JobService, *, exclude_job_ids: Collection[UUID] | None = None) -> None:
         """
-        Abort all running orphan training jobs (that do not belong to any worker).
+        Reconcile RUNNING training jobs left behind by a previous process.
 
-        This method can be called during application shutdown/setup to ensure that
-        any orphan in-progress training jobs are marked as failed.
+        Called on training-worker setup and teardown. A remote or SSH-provisioned
+        trainer keeps running independently of the studio, so a RUNNING job that
+        already recorded its ``remote_job_id`` is requeued (back to PENDING) to
+        reattach and mirror progress on the next pickup -- this is what lets a run
+        survive the studio restarting (e.g. the laptop was closed overnight). Any
+        other orphaned RUNNING training job cannot resume and is marked FAILED.
+
+        Args:
+            job_service: Used to list and update RUNNING training jobs.
+            exclude_job_ids: Job ids to skip entirely, because another
+                recovery pass (e.g. `services.ssh.recovery.recover_ssh_jobs`)
+                already rendered an explicit verdict for them. Without this,
+                an SSH job that pass just confirmed healthy but that hasn't
+                yet persisted its own ``remote_job_id`` (a crash between
+                provisioning and the trainer job being submitted) would be
+                re-judged here using only ``remote_job_id`` and incorrectly
+                failed.
         """
+        excluded = frozenset(exclude_job_ids) if exclude_job_ids is not None else frozenset()
         query = {"status": JobStatus.RUNNING, "type": JobType.TRAINING}
-        running_jobs = await JobService.get_job_list(extra_filters=query)
+        running_jobs = await job_service.get_job_list(extra_filters=query)
         for job in running_jobs:
+            if job.id in excluded:
+                continue
+            remote_job_id = TrainingService._reattachable_remote_job_id(job)
+            if remote_job_id is not None:
+                logger.info(
+                    "Requeuing remote training job {} to reattach to trainer job {}",
+                    job.id,
+                    remote_job_id,
+                )
+                await job_service.update_job_status(
+                    job_id=job.id,
+                    status=JobStatus.PENDING,
+                    message="Reconnecting to remote training job after restart",
+                )
+                continue
             logger.warning(f"Aborting orphan training job with id: {job.id}")
-            await JobService.update_job_status(
+            await job_service.update_job_status(
                 job_id=job.id,
                 status=JobStatus.FAILED,
                 message="Job aborted due to application shutdown",
             )
+
+    # Targets whose trainer keeps running independently of the studio process,
+    # and so can be reattached to after a restart via their remote_job_id.
+    _REATTACHABLE_TARGETS = (TrainingTarget.REMOTE, TrainingTarget.SSH)
+
+    @staticmethod
+    def _reattachable_remote_job_id(job: object) -> UUID | None:
+        """Return the persisted remote job id for a training job, if any.
+
+        Only `RemoteTrainJobPayload` and `SshTrainJobPayload` carry a
+        reattachable `remote_job_id`; class identity already encodes the
+        target, so no separate read of `training_target` is needed here.
+        """
+        payload = getattr(job, "payload", None)
+        if isinstance(payload, RemoteTrainJobPayload | SshTrainJobPayload):
+            return payload.remote_job_id
+        if isinstance(payload, dict):
+            remote_job_id = payload.get("remote_job_id")
+            if payload.get("training_target") not in {target.value for target in TrainingService._REATTACHABLE_TARGETS}:
+                return None
+            try:
+                return UUID(str(remote_job_id))
+            except (TypeError, ValueError, AttributeError):
+                return None
+        return None

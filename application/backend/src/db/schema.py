@@ -1,15 +1,112 @@
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
-
-from schemas.robot import RobotType
 
 
 class Base(DeclarativeBase):
     pass
+
+
+class RemoteTrainerDB(Base):
+    """A direct trainer endpoint configured for reuse across projects."""
+
+    __tablename__ = "remote_trainers"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True, default=lambda: str(uuid4()))
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    connection_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="direct")
+    url: Mapped[str] = mapped_column(String(2048), nullable=False, unique=True)
+    ssh_host_alias: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    ssh_hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    ssh_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ssh_username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    ssh_identity_file: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    ssh_remote_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ssh_local_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.current_timestamp())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
+    )
+
+
+class RemoteServerDB(Base):
+    """An SSH-provisioned training server, identified by an SSH config alias.
+
+    Holds no credential. ``ssh_host_alias`` names a ``Host`` entry in the user's
+    own SSH config; the SSH client library resolves it and authenticates, so
+    Studio never receives a key, password, or passphrase. Hostname, port, and
+    user are derived from the SSH config at read time rather than persisted, so a
+    stored record can never silently disagree with the config that defines it.
+    """
+
+    __tablename__ = "remote_servers"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True, default=lambda: str(uuid4()))
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Unique: a second record for the same alias describes the same machine.
+    ssh_host_alias: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    device_type: Mapped[str] = mapped_column(String, nullable=False)
+    # Summary of the most recent preflight. A transient failure updates these
+    # columns instead of destroying the record.
+    last_check_status: Mapped[str] = mapped_column(String(32), nullable=False, default="unknown")
+    last_check_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_check_latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_check_reason_code: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Per-check detail (image resolution, signature, device probe, protocol) for
+    # the most recent Tier 2 ``/check`` run, serialized `PreflightCheck` list.
+    # Persisted so the UI can render the last verification's detail after a page
+    # refresh instead of resetting to "Not verified yet" until the user reruns it.
+    last_check_checks: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.current_timestamp())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
+    )
+
+
+class JobProvisioningDB(Base):
+    """What Studio provisioned on a remote server for one job.
+
+    Keyed by ``job_id`` in its own table rather than stored in the job payload
+    JSON, so a restarted backend can sweep or reclaim an orphaned container with
+    a query instead of parsing every job's payload.
+    """
+
+    __tablename__ = "job_provisioning"
+
+    job_id: Mapped[str] = mapped_column(Text, ForeignKey("jobs.id", ondelete="CASCADE"), primary_key=True)
+    # RESTRICT, not CASCADE: deleting a server while one of its jobs is still
+    # running would drop the only record of the container to clean up.
+    remote_server_id: Mapped[str] = mapped_column(
+        Text,
+        ForeignKey("remote_servers.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    ssh_host_alias: Mapped[str] = mapped_column(String(255), nullable=False)
+    image_ref: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    image_fallback_reason: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    image_digest: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    container_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    container_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    remote_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    local_tunnel_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Ownership marker for the orphan sweep: two Studio instances can target the
+    # same host, so a sweep must prove the container is its own.
+    backend_instance_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    trainer_build_version: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    trainer_protocol_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.current_timestamp())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        server_default=func.current_timestamp(),
+        onupdate=func.current_timestamp(),
+    )
 
 
 class ProjectDB(Base):
@@ -56,59 +153,12 @@ class ProjectRobotDB(Base):
     id: Mapped[UUID] = mapped_column(Text, primary_key=True, default=uuid4)
     project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
     name: Mapped[str] = mapped_column(String(255))
-    type: Mapped[RobotType] = mapped_column(Enum(RobotType))
+    type: Mapped[str] = mapped_column(String(64))
     payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.current_timestamp())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.current_timestamp())
 
-    # A robot may have 1 active calibration at a time
-    active_calibration_id: Mapped[str | None] = mapped_column(
-        ForeignKey("robot_calibrations.id", ondelete="CASCADE"),
-        nullable=True,
-    )
-
     project: Mapped["ProjectDB"] = relationship(back_populates="robots")
-
-
-class RobotCalibrationDB(Base):
-    __tablename__ = "robot_calibrations"
-
-    id: Mapped[UUID] = mapped_column(Text, primary_key=True, default=uuid4)
-    # TODO: consider making this more structured, possibly via another `calibration_values` table
-    # Atm this json is considered to be a dict with joint name as key and value
-    # values: Mapped[JSON] = mapped_column(JSON(), nullable=False)
-
-    file_path: Mapped[str] = mapped_column(String(255), nullable=False)
-
-    # A robot may have multiple stored calibrations, but only 1 is considered active via robot.calibration_id
-    robot_id: Mapped[UUID] = mapped_column(ForeignKey("project_robots.id", ondelete="CASCADE"))
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.current_timestamp())
-    updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.current_timestamp())
-
-    values: Mapped[list["CalibrationValuesDB"]] = relationship(
-        "CalibrationValuesDB",
-        back_populates="calibration",
-        cascade="all, delete-orphan",
-        lazy="selectin",
-    )
-
-
-class CalibrationValuesDB(Base):
-    __tablename__ = "calibration_values"
-    id: Mapped[int] = mapped_column(Integer, nullable=False, primary_key=True)  # Motor ID
-    joint_name: Mapped[str] = mapped_column(String(255), nullable=False)
-
-    calibration_id: Mapped[UUID] = mapped_column(
-        ForeignKey("robot_calibrations.id", ondelete="CASCADE"),
-        primary_key=True,
-    )
-
-    drive_mode: Mapped[int] = mapped_column(Integer, nullable=False)
-    homing_offset: Mapped[int] = mapped_column(Integer, nullable=False)
-    range_min: Mapped[int] = mapped_column(Integer, nullable=False)
-    range_max: Mapped[int] = mapped_column(Integer, nullable=False)
-
-    calibration: Mapped["RobotCalibrationDB"] = relationship(back_populates="values")
 
 
 class ProjectCameraDB(Base):
