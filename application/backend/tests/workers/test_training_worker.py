@@ -226,7 +226,9 @@ class TestTraining:
             mock_load.assert_called_once_with(model, compile_model=False)
 
             trainer.fit.assert_called_once()
-            trainer.save_checkpoint.assert_called_once_with(tmp_path / "cache" / str(job.id) / "model.ckpt")
+            trainer.save_checkpoint.assert_called_once_with(
+                tmp_path / "cache" / str(job.id) / "model.ckpt", weights_only=True
+            )
 
             MockJobService.update_job.assert_called_once()
             assert MockJobService.update_job_status.call_args_list[0].kwargs["status"] == JobStatus.COMPLETED

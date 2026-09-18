@@ -262,8 +262,14 @@ class Pi05Preprocessor(torch.nn.Module):
             img = batch[key][:, -1, :, :, :] if batch[key].ndim == max_image_dim else batch[key]
             batch.pop(key)
 
+            # Raw camera frames arrive as uint8 in [0, 255]; dataset-sourced
+            # tensors already arrive as float32 in [0, 1]. Scale only the
+            # former so both paths reach the [0, 1] range this method expects.
+            is_uint8 = img.dtype == torch.uint8
             if img.dtype != torch.float32:
                 img = img.to(torch.float32)
+            if is_uint8:
+                img = img / 255.0
 
             # Check format: [B, C, H, W] vs [B, H, W, C]
             is_channels_first = img.shape[1] == 3  # noqa: PLR2004
@@ -278,8 +284,11 @@ class Pi05Preprocessor(torch.nn.Module):
             # Normalize [0,1] -> [-1,1]
             img = img * 2.0 - 1.0
 
-            if is_channels_first:
-                img = img.permute(0, 3, 1, 2)  # -> [B, C, H, W]
+            # embed_prefix always requires [B, C, H, W], regardless of the
+            # original layout — raw camera frames arrive as HWC uint8, so
+            # this permute must run unconditionally, not only when the
+            # input already happened to be channels-first.
+            img = img.permute(0, 3, 1, 2)  # -> [B, C, H, W]
 
             bsize = img.shape[0]
             mask = torch.ones(bsize, dtype=torch.bool, device=device)

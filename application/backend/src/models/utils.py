@@ -44,15 +44,30 @@ def load_inference_model(model: Model, inference_device: InferenceDevice) -> Inf
     )
 
 
-def setup_policy(model: Model, *, compile_model: bool = False) -> Policy:
-    """Setup policy for Model training."""
+def setup_policy(model: Model, *, compile_model: bool = False, freeze_vision_encoder: bool = False) -> Policy:
+    """Setup policy for Model training.
+
+    Args:
+        model: Model record specifying which policy to instantiate.
+        compile_model: Whether to use torch.compile for supported policies.
+        freeze_vision_encoder: Freeze the vision encoder to reduce activation memory.
+            Only supported by pi05 and smolvla; ignored for other policies.
+    """
     if model.policy == "act":
         return ACT(compile_model=compile_model)
     if model.policy == "pi0":
         return Pi0(compile_model=compile_model)
     if model.policy == "pi05":
-        return Pi05(pretrained_name_or_path="lerobot/pi05_base", compile_model=compile_model)
+        return Pi05(
+            pretrained_name_or_path="lerobot/pi05_base",
+            compile_model=compile_model,
+            freeze_vision_encoder=freeze_vision_encoder,
+        )
     if model.policy == "smolvla":
-        return SmolVLA(pretrained_name_or_path="lerobot/smolvla_base", compile_model=compile_model)
+        return SmolVLA(
+            pretrained_name_or_path="lerobot/smolvla_base",
+            compile_model=compile_model,
+            freeze_vision_encoder=freeze_vision_encoder,
+        )
 
     raise ValueError(f"Policy not implemented yet: {model.policy}")

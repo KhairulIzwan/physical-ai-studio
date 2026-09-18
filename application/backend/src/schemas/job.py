@@ -85,6 +85,13 @@ class TrainJobPayload(BaseModel):
         description="Training precision ('32-true', 'bf16-mixed')",
     )
     compile_model: bool = Field(default=False, description="Enable torch.compile for supported policies")
+    freeze_vision_encoder: bool = Field(
+        default=False,
+        description=(
+            "Freeze the vision encoder during training. Reduces activation memory for "
+            "pi05/smolvla; ignored by policies that don't support it."
+        ),
+    )
 
     @field_serializer("project_id")
     def serialize_project_id(self, project_id: UUID, _info: Any) -> str:

@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import gc
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+import torch
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger
 
@@ -142,7 +144,11 @@ class TrainingWorker(BaseProcessWorker):
             if base_model is not None:
                 policy = load_policy(base_model, compile_model=payload.compile_model)
             else:
-                policy = setup_policy(model, compile_model=payload.compile_model)
+                policy = setup_policy(
+                    model,
+                    compile_model=payload.compile_model,
+                    freeze_vision_encoder=payload.freeze_vision_encoder,
+                )
 
             precision = str(payload.precision)
             strategy = get_lightning_strategy(device_type)
@@ -154,6 +160,11 @@ class TrainingWorker(BaseProcessWorker):
                 save_top_k=1,
                 monitor="val/loss",
                 mode="min",
+                # load_policy() only ever restores weights for inference/fine-tuning,
+                # never optimizer state, so skip it: Adam's per-param moment buffers
+                # roughly triple the checkpoint's memory/disk footprint for large
+                # models and have caused OOM kills during checkpoint writes.
+                save_weights_only=True,
             )
             csv_logger = CSVLogger(cache_path.parent, name=cache_path.stem)
 
@@ -183,8 +194,12 @@ class TrainingWorker(BaseProcessWorker):
             dispatcher.start()
             trainer.fit(model=policy, datamodule=l_dm)
 
+            del l_dm
+            self._release_training_memory()
+
             final_checkpoint = cache_path / "model.ckpt"
-            trainer.save_checkpoint(final_checkpoint)
+            if not final_checkpoint.exists():
+                self._save_final_checkpoint_if_missing(trainer, final_checkpoint)
 
             path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(cache_path, path)
@@ -215,6 +230,67 @@ class TrainingWorker(BaseProcessWorker):
             dispatcher.join(timeout=10)
         self.queue.put((EventType.JOB_UPDATE, job))
 
+    @staticmethod
+    def _release_training_memory() -> None:
+        """Release cached tensors/allocator memory after fit() and before checkpoint/export.
+
+        On memory-constrained (iGPU, shared-RAM) hosts, dataloader workers and cached
+        tensors are still fully resident right after fit() returns, and both the
+        checkpoint save and the export step can need a large amount of additional
+        headroom -- this must run unconditionally on the common path, not only on the
+        fallback-save path, otherwise export can OOM even when training and
+        checkpointing both succeeded.
+        """
+        gc.collect()
+        if torch.xpu.is_available():
+            torch.xpu.empty_cache()
+
+    @staticmethod
+    def _save_final_checkpoint_if_missing(trainer: Trainer, final_checkpoint: Path) -> None:
+        """Fall back to an explicit checkpoint save when none exists yet.
+
+        ModelCheckpoint (monitor="val/loss") writes to this same path whenever a
+        validation epoch completes, so on the common path it has already produced a
+        usable checkpoint and an explicit save here would be pure duplicate work. This
+        fallback only runs for the edge case where training ended before any
+        validation ran (e.g. max_steps too small for one epoch), guaranteeing a
+        checkpoint always exists.
+        """
+        trainer.save_checkpoint(final_checkpoint, weights_only=True)
+
+    # Backends that trace the model graph (ONNX export, and OpenVINO which goes via
+    # ONNX) need multiple copies of the model's parameters/activations resident at
+    # once. For very large policies (multi-billion parameter VLA/VLM models) this can
+    # exceed available memory even though the checkpoint save itself succeeded, which
+    # is exactly what caused a post-100%-progress OOM kill on this iGPU/shared-RAM
+    # host right after a training run had otherwise completed cleanly.
+    _TRACED_EXPORT_BACKENDS = {"onnx", "openvino"}
+    _BYTES_PER_PARAM_TRACE_ESTIMATE = 4 * 3  # fp32 param + activation/graph overhead
+    _EXPORT_MEMORY_SAFETY_MARGIN = 1.2
+
+    def _has_enough_memory_for_traced_export(self, policy: object) -> bool:
+        try:
+            import psutil
+
+            param_count = sum(p.numel() for p in policy.parameters())
+            estimated_bytes = param_count * self._BYTES_PER_PARAM_TRACE_ESTIMATE * self._EXPORT_MEMORY_SAFETY_MARGIN
+            available_bytes = psutil.virtual_memory().available
+        except Exception as e:  # best-effort guard, never block export on failure to check
+            logger.warning("Could not estimate memory needs for traced export; proceeding anyway")
+            logger.exception(e)
+            return True
+
+        if estimated_bytes > available_bytes:
+            logger.warning(
+                "Skipping traced export: policy has ~{}M params, estimated export memory need "
+                "{:.1f}GB exceeds {:.1f}GB currently available",
+                param_count // 1_000_000,
+                estimated_bytes / 1e9,
+                available_bytes / 1e9,
+            )
+            return False
+        return True
+
     async def _export_policy(self, policy: object, path: Path, job: Job) -> None:
         if not isinstance(policy, ExportablePolicyMixin):
             logger.info("Skipping export: policy does not support export backends")
@@ -223,6 +299,10 @@ class TrainingWorker(BaseProcessWorker):
         logger.info("Starting model export for trained policy")
         for backend in policy.get_supported_export_backends():
             backend_name = backend.value if hasattr(backend, "value") else str(backend)
+            if backend_name.lower() in self._TRACED_EXPORT_BACKENDS and not self._has_enough_memory_for_traced_export(
+                policy
+            ):
+                continue
             try:
                 logger.info("Exporting model to {} format", backend_name)
                 await JobService.update_job_status(
@@ -233,6 +313,7 @@ class TrainingWorker(BaseProcessWorker):
                 export_dir = path / "exports" / backend
                 policy.export(export_dir, backend=backend)
                 logger.info("Model export to {} completed", backend_name)
+                self._release_training_memory()
             except Exception as e:
                 logger.error("Failed exporting model to {} format", backend_name)
                 logger.exception(e)
