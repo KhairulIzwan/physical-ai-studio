@@ -172,6 +172,14 @@ class TrainJobPayloadBase(BaseModel):
         description="Training precision ('32-true', 'bf16-mixed')",
     )
     compile_model: bool = Field(default=False, description="Enable torch.compile for supported policies")
+    cpu_offload: bool = Field(
+        default=False,
+        description=(
+            "Offload frozen model parameters and optimizer states to CPU RAM (DeepSpeed ZeRO Stage 3 "
+            "offload), trading throughput for the ability to train models that don't fit in GPU VRAM "
+            "otherwise. Only applies on CUDA; ignored on other accelerators."
+        ),
+    )
     freeze_vision_encoder: bool = Field(
         default=False,
         description=(

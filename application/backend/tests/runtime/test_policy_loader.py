@@ -231,6 +231,31 @@ def test_loader_instantiates_sync_execution(tmp_path, monkeypatch: pytest.Monkey
     source.shutdown_policy()
 
 
+def test_loader_instantiates_async_execution_when_enabled(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Setting ``POLICY_ASYNC_EXECUTION_ENABLED=1`` switches the built PolicySource to AsyncExecution.
+
+    This is the fix for the decision/policy loop blocking the camera-gated
+    control loop tick during inference (see ``control_loop_100hz.py`` for the
+    analogous fix already applied to the actuator loop).
+    """
+    from physicalai.runtime import AsyncExecution
+
+    from runtime.config_builder import POLICY_REQUEST_THRESHOLD
+
+    model_id = uuid4()
+    _export_dir(tmp_path, model_id)
+    monkeypatch.setattr("physicalai.inference.InferenceModel", FakeInferenceModel)
+    monkeypatch.setenv("POLICY_ASYNC_EXECUTION_ENABLED", "1")
+    source, mailbox, _events, follower = _source(models_dir=tmp_path)
+    mailbox.apply(LoadModelCommand(model_id=model_id, inference_device=_DEVICE))
+    source.update(follower.get_observation(), {}, 0)
+    _wait_until(lambda: source._policy is not None)
+    assert source._policy is not None
+    assert isinstance(source._policy._execution, AsyncExecution)
+    assert source._policy._execution._threshold_frac == POLICY_REQUEST_THRESHOLD
+    source.shutdown_policy()
+
+
 def _load_and_wait(source, mailbox, follower, command: LoadModelCommand, step: int) -> None:
     mailbox.apply(command)
     source.update(follower.get_observation(), {}, step)

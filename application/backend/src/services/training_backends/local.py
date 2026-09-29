@@ -119,6 +119,8 @@ def build_spec(context: TrainingContext) -> TrainingJobSpec:
         val_split=payload.val_split,
         precision=str(payload.precision),
         compile_model=payload.compile_model,
+        cpu_offload=payload.cpu_offload,
+        freeze_vision_encoder=payload.freeze_vision_encoder,
         augment_images=payload.augment_images,
         auto_scale_batch_size=payload.auto_scale_batch_size,
         lora_enabled=payload.lora_enabled,

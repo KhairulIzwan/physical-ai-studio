@@ -84,6 +84,9 @@ PEFT_POLICIES = frozenset({"pi05", "pi0"})
 """Policies whose ``Config`` mixes in ``physicalai.policies.mixins.peft.PeftConfigMixin`` and
 support LoRA/DoRA fine-tuning."""
 
+FREEZE_VISION_ENCODER_POLICIES = frozenset({"pi05", "smolvla"})
+"""Policies whose constructor accepts ``freeze_vision_encoder`` to reduce activation memory."""
+
 
 class RunOptions(BaseModel):
     """Runtime-only controls which are not part of the training payload."""
@@ -127,6 +130,20 @@ class TrainingJobSpec(BaseModel):
     val_split: float = Field(default=0.1, ge=0.0, lt=1.0, description="Fraction of episodes held out for validation.")
     precision: str = Field(default="bf16-mixed", description="Lightning precision, e.g. '32-true' or 'bf16-mixed'.")
     compile_model: bool = Field(default=False, description="Whether to torch.compile the policy forward pass.")
+    cpu_offload: bool = Field(
+        default=False,
+        description=(
+            "Offload frozen parameters and optimizer states to CPU RAM (DeepSpeed ZeRO Stage 3 offload) "
+            "so models larger than GPU VRAM can still train. Only applies on CUDA."
+        ),
+    )
+    freeze_vision_encoder: bool = Field(
+        default=False,
+        description=(
+            "Freeze the vision encoder during training to reduce activation memory. "
+            f"Only supported by {sorted(FREEZE_VISION_ENCODER_POLICIES)}; ignored otherwise."
+        ),
+    )
     augment_images: bool = Field(
         default=False,
         description="Whether to augment training images with the default pipeline.",
@@ -257,6 +274,8 @@ def build_policy(spec: TrainingJobSpec, *, resume_from: Path | str | None = None
         if pretrained is not None:
             kwargs["pretrained_name_or_path"] = pretrained
     kwargs.update(_camera_layout_kwargs(spec))
+    if spec.freeze_vision_encoder and spec.policy.lower() in FREEZE_VISION_ENCODER_POLICIES:
+        kwargs["freeze_vision_encoder"] = True
     if spec.lora_enabled:
         kwargs.update(
             lora_enabled=True,
@@ -416,7 +435,7 @@ def run_training_job(
             logger=CSVLogger(cache_dir.parent, name=cache_dir.stem),
             callbacks=callbacks,
             accelerator=accelerator,
-            strategy=resolve_strategy(spec.device_type),
+            strategy=resolve_strategy(spec.device_type, cpu_offload=spec.cpu_offload),
             devices=resolve_devices(spec.device_index),
             max_epochs=spec.max_epochs,
             auto_scale_batch_size=spec.auto_scale_batch_size,
@@ -637,6 +656,40 @@ def _backend_name(backend: Any) -> str:
     return backend.value if hasattr(backend, "value") else str(backend)
 
 
+# Backends that trace the model graph (ONNX export, and OpenVINO which goes via ONNX)
+# need multiple copies of the model's parameters/activations resident at once. For very
+# large policies (multi-billion parameter VLA/VLM models) this can exceed available memory
+# even though training and the checkpoint save both succeeded — this guard turns that into
+# a skipped backend instead of an OOM kill partway through an otherwise-complete job.
+_TRACED_EXPORT_BACKENDS = frozenset({"onnx", "openvino"})
+_BYTES_PER_PARAM_TRACE_ESTIMATE = 4 * 3  # fp32 param + activation/graph overhead
+_EXPORT_MEMORY_SAFETY_MARGIN = 1.2
+
+
+def _has_enough_memory_for_traced_export(policy: Policy) -> bool:
+    """Best-effort check that a traced export (ONNX/OpenVINO) is unlikely to OOM."""
+    try:
+        import psutil
+
+        param_count = sum(p.numel() for p in policy.parameters())
+        estimated_bytes = param_count * _BYTES_PER_PARAM_TRACE_ESTIMATE * _EXPORT_MEMORY_SAFETY_MARGIN
+        available_bytes = psutil.virtual_memory().available
+    except Exception:
+        logger.warning("Could not estimate memory needs for traced export; proceeding anyway", exc_info=True)
+        return True
+
+    if estimated_bytes > available_bytes:
+        logger.warning(
+            "Skipping traced export: policy has ~%dM params, estimated export memory need "
+            "%.1fGB exceeds %.1fGB currently available",
+            param_count // 1_000_000,
+            estimated_bytes / 1e9,
+            available_bytes / 1e9,
+        )
+        return False
+    return True
+
+
 def _export(policy: Policy, output_dir: Path, report: ReportFn, requested: list[str] | None = None) -> None:
     """Export the policy to the requested backends, or to every one it supports.
 
@@ -663,6 +716,8 @@ def _export(policy: Policy, output_dir: Path, report: ReportFn, requested: list[
 
     for backend in backends:
         name = _backend_name(backend)
+        if name.lower() in _TRACED_EXPORT_BACKENDS and not _has_enough_memory_for_traced_export(policy):
+            continue
         try:
             logger.info("Exporting model to %s format", name)
             report(99, f"Exporting to {name} format", {})

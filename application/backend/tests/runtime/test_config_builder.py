@@ -14,6 +14,7 @@ from runtime.config_builder import (
     RUNTIME_FPS,
     build_runtime_config,
     policy_source_fragment,
+    policy_source_from_fragment,
     runtime_camera_keys,
     runtime_config_change_me,
     runtime_export_readme,
@@ -259,6 +260,35 @@ def test_policy_source_fragment_matches_the_session_recipe() -> None:
 def test_empty_task_is_omitted_from_the_fragment() -> None:
     fragment = policy_source_fragment(export_dir="./exports/torch", backend="torch", device="cpu", task="")
     assert "task" not in fragment["init_args"]
+
+
+def test_policy_source_fragment_execution_mode_selects_async() -> None:
+    fragment = policy_source_fragment(
+        export_dir="./exports/torch",
+        backend="torch",
+        device="cpu",
+        execution_mode="async",
+    )
+    assert fragment["init_args"]["execution"]["class_path"] == "physicalai.runtime.AsyncExecution"
+    assert fragment["init_args"]["execution"]["init_args"]["request_threshold"] == POLICY_REQUEST_THRESHOLD
+
+
+def test_policy_source_from_fragment_builds_matching_execution(monkeypatch: pytest.MonkeyPatch) -> None:
+    from physicalai.runtime import AsyncExecution, SyncExecution
+
+    from .fakes import FakeInferenceModel
+
+    monkeypatch.setattr("physicalai.inference.InferenceModel", FakeInferenceModel)
+
+    sync_source = policy_source_from_fragment(
+        policy_source_fragment(export_dir="./exports/torch", backend="torch", device="cpu")
+    )
+    assert isinstance(sync_source._execution, SyncExecution)
+
+    async_source = policy_source_from_fragment(
+        policy_source_fragment(export_dir="./exports/torch", backend="torch", device="cpu", execution_mode="async")
+    )
+    assert isinstance(async_source._execution, AsyncExecution)
 
 
 async def test_inference_export_document_uses_the_policy_fragment(mocker: Any) -> None:

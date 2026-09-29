@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -115,6 +116,8 @@ class StudioActionSource:
         camera_frames: Mapping[str, Frame],
         step: int,
     ) -> np.ndarray:
+        tick_timestamp = time.time()
+        logger.debug("action_source tick step={} timestamp={}", step, tick_timestamp)
         self._last_robot_state = robot_state
         self._last_camera_frames = camera_frames
         self._drain_commands(robot_state)

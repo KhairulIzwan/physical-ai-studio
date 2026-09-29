@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from physicalai.capture import ColorMode, SharedCamera
 from physicalai.config import Config, to_config, validate_config
@@ -71,19 +71,29 @@ def policy_source_fragment(
     backend: str,
     device: str,
     task: str | None = None,
+    execution_mode: Literal["sync", "async"] = "sync",
 ) -> dict[str, Any]:
     """Return the PolicySource recipe both the session and the export instantiate.
 
     `` Omit ``policy_name`` so the manifest is read. Omit ``duration_frames`` so
     ``LerpSmoother`` keeps its upstream default of 5.
+
+    ``execution_mode="async"`` selects ``physicalai.runtime.AsyncExecution``,
+    which runs inference on a background thread so a slow model call no
+    longer blocks the camera-gated control loop tick (unlike the default
+    ``SyncExecution``). Experimental, opt-in via
+    ``settings.policy_async_execution_enabled``.
     """
+    execution_class_path = (
+        "physicalai.runtime.AsyncExecution" if execution_mode == "async" else "physicalai.runtime.SyncExecution"
+    )
     init_args: dict[str, Any] = {
         "model": Config(
             "physicalai.inference.InferenceModel",
             {"export_dir": export_dir, "backend": backend, "device": device},
         ).to_dict(),
         "execution": Config(
-            "physicalai.runtime.SyncExecution",
+            execution_class_path,
             {"request_threshold": POLICY_REQUEST_THRESHOLD},
         ).to_dict(),
         "action_queue": Config(
@@ -104,11 +114,22 @@ def policy_source_from_fragment(fragment: dict[str, Any]) -> PolicySource:
     the same constructors Studio already uses.
     """
     from physicalai.inference import InferenceModel
-    from physicalai.runtime import ChunkedActionQueue, LerpSmoother, PolicySource, SyncExecution
+    from physicalai.runtime import (
+        AsyncExecution,
+        ChunkedActionQueue,
+        Execution,
+        LerpSmoother,
+        PolicySource,
+        SyncExecution,
+    )
 
     args = fragment["init_args"]
     model_args = args["model"]["init_args"]
-    exec_args = args["execution"]["init_args"]
+    exec_fragment = args["execution"]
+    exec_args = exec_fragment["init_args"]
+    is_async = exec_fragment["class_path"] == "physicalai.runtime.AsyncExecution"
+    execution_cls = AsyncExecution if is_async else SyncExecution
+    execution: Execution = execution_cls(request_threshold=exec_args["request_threshold"])
     return PolicySource(
         model=InferenceModel(
             export_dir=model_args["export_dir"],
@@ -116,7 +137,7 @@ def policy_source_from_fragment(fragment: dict[str, Any]) -> PolicySource:
             backend=model_args["backend"],
             device=model_args["device"],
         ),
-        execution=SyncExecution(request_threshold=exec_args["request_threshold"]),
+        execution=execution,
         action_queue=ChunkedActionQueue(smoother=LerpSmoother()),
         task=args.get("task"),
     )

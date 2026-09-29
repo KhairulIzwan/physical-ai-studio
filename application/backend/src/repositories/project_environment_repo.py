@@ -5,7 +5,7 @@ from loguru import logger
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio.session import AsyncSession
 
-from db.schema import EnvironmentCameraDB, EnvironmentRobotDB, ProjectEnvironmentDB
+from db.schema import DatasetDB, EnvironmentCameraDB, EnvironmentRobotDB, ProjectEnvironmentDB
 from repositories.base import ProjectBaseRepository
 from repositories.mappers import ProjectCameraMapper, ProjectEnvironmentMapper, ProjectRobotMapper
 from robots.catalog.registry import RobotCatalogRegistry
@@ -153,6 +153,20 @@ class ProjectEnvironmentRepository(ProjectBaseRepository[Environment, ProjectEnv
             .where(
                 ProjectEnvironmentDB.project_id == self.project_id,
                 or_(EnvironmentRobotDB.robot_id == rid, EnvironmentRobotDB.tele_operator_robot_id == rid),
+            )
+            .distinct()
+        )
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
+
+    async def find_dataset_names_using_environment(self, environment_id: UUID) -> list[str]:
+        """Return names of datasets in this project that reference the environment."""
+        eid = str(environment_id)
+        stmt = (
+            select(DatasetDB.name)
+            .where(
+                DatasetDB.project_id == str(self.project_id),
+                DatasetDB.environment_id == eid,
             )
             .distinct()
         )

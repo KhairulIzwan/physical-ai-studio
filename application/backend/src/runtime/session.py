@@ -15,6 +15,7 @@ from internal_datasets.access_mode import DatasetAccessMode
 from internal_datasets.lerobot.lerobot_dataset import InternalLeRobotDataset
 from robots.shared_robot_errors import translate_robot_error
 from runtime.action_source import StudioActionSource
+from runtime.callbacks.inference_metrics import InferenceMetricsCallback
 from runtime.callbacks.recording import RecordingCallback, RecordingState
 from runtime.callbacks.stream import StreamCallback
 from runtime.command_thread import CommandWorker
@@ -27,6 +28,7 @@ from runtime.contract import (
     SaveEpisodeCommand,
     StateEvent,
 )
+from runtime.control_loop_100hz import ActuatorLoop100Hz
 from runtime.dataset_features import build_lerobot_dataset_features
 from settings import get_settings
 
@@ -82,6 +84,7 @@ class RuntimeSession:
         self._stream_callback: StreamCallback | None = None
         self._recording = RecordingState()
         self._recording_callback: RecordingCallback | None = None
+        self._inference_metrics_callback = InferenceMetricsCallback()
         self._command_worker = CommandWorker()
         self._runtime: RobotRuntime | None = None
         self._disconnect_requested = False
@@ -90,6 +93,8 @@ class RuntimeSession:
     async def setup(self) -> None:
         init_args = self._document["init_args"]
         self._follower = cast("Robot", Config.from_dict(init_args["robot"]).instantiate())
+        if get_settings().actuator_loop_100hz_enabled:
+            self._follower = cast("Robot", ActuatorLoop100Hz(self._follower))
         action_source = init_args.get("action_source")
         if isinstance(action_source, dict):
             source_args = action_source.get("init_args", {})
@@ -138,7 +143,7 @@ class RuntimeSession:
             action_source=self._action_source,
             cameras=self._cameras,
             fps=float(self._document["init_args"]["fps"]),
-            callbacks=[self._stream_callback, self._recording_callback],
+            callbacks=[self._stream_callback, self._recording_callback, self._inference_metrics_callback],
         )
         if self._disconnect_requested:
             self._runtime.stop()
@@ -213,17 +218,35 @@ class RuntimeSession:
         # Stop the policy worker before dropping devices it may still be reading.
         if self._action_source is not None:
             self._action_source.shutdown_policy()
-        # Cameras first so a wedged publisher cannot strand the arm connected.
-        for key, camera in self._cameras.items():
-            try:
-                camera.disconnect()
-            except Exception as exc:
-                logger.warning("Camera {} disconnect failed: {}", key, exc)
+        # The leader is never handed to RobotRuntime, so it is always ours to close.
         if self._leader is not None:
             try:
                 self._leader.disconnect()
             except Exception as exc:
                 logger.warning("Leader disconnect failed: {}", exc)
+        if self._runtime is not None:
+            # Cameras and the follower are owned by RobotRuntime once built; go
+            # through its disconnect() rather than closing them by hand so it
+            # also closes the callback bus (flushing InferenceMetricsCallback
+            # and friends). By this point session.run() has already returned,
+            # so the runtime's run-lock is free and this cannot raise for
+            # "run() is active".
+            try:
+                self._runtime.disconnect()
+            except Exception as exc:
+                logger.warning("Runtime disconnect failed: {}", exc)
+        else:
+            # run() never got far enough to build a runtime (e.g. setup failed
+            # before build_runtime()); fall back to closing devices directly.
+            self._disconnect_devices_without_runtime()
+
+    def _disconnect_devices_without_runtime(self) -> None:
+        """Close cameras and the follower when no RobotRuntime was ever built."""
+        for key, camera in self._cameras.items():
+            try:
+                camera.disconnect()
+            except Exception as exc:
+                logger.warning("Camera {} disconnect failed: {}", key, exc)
         if self._follower is not None:
             try:
                 self._follower.disconnect()

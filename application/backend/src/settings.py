@@ -234,6 +234,25 @@ class Settings(BaseSettings):
     )
     openapi_url: str = "/api/openapi.json"
     debug: bool = Field(default=False, alias="DEBUG")
+    actuator_loop_100hz_enabled: bool = Field(
+        default=False,
+        alias="ACTUATOR_LOOP_100HZ_ENABLED",
+        description=(
+            "Decouple actuator bus writes onto a dedicated ~100 Hz background thread "
+            "(see runtime.control_loop_100hz.ActuatorLoop100Hz), instead of writing "
+            "synchronously in the camera-gated control loop. Experimental."
+        ),
+    )
+    policy_async_execution_enabled: bool = Field(
+        default=False,
+        alias="POLICY_ASYNC_EXECUTION_ENABLED",
+        description=(
+            "Run policy inference on physicalai.runtime's background-thread "
+            "AsyncExecution strategy instead of the default SyncExecution, so a "
+            "slow inference call no longer blocks the camera-gated control loop "
+            "tick. Experimental."
+        ),
+    )
     environment: Literal["dev", "prod"] = "dev"
     storage_dir: Path = Field(default_factory=get_default_storage_dir, alias="STORAGE_DIR")
     static_files_dir: str | None = Field(default=None, alias="STATIC_FILES_DIR")

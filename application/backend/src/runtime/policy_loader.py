@@ -145,11 +145,13 @@ class PolicyLoader:
         export_dir = self._export_dir(command)
         if not export_dir.exists():
             raise FileNotFoundError(export_dir)
+        execution_mode = "async" if get_settings().policy_async_execution_enabled else "sync"
         source = policy_source_from_fragment(
             policy_source_fragment(
                 export_dir=str(export_dir),
                 backend=command.inference_device.backend.value,
                 device=command.inference_device.device,
+                execution_mode=execution_mode,
             )
         )
         if not isinstance(source, PolicySource):

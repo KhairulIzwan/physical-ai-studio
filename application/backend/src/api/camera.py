@@ -6,6 +6,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Query, WebSocket
 from fastapi.responses import Response
 from fastapi.websockets import WebSocketDisconnect
+from starlette.websockets import WebSocketState
 
 from api.dependencies import CameraClaimRegistryDep, SchedulerDep
 from schemas.camera import SupportedCameraFormat
@@ -131,9 +132,13 @@ async def camera_websocket(
         worker.start()
         while True:
             async with run_at_frequency(camera.payload.fps):
+                if websocket.client_state != WebSocketState.CONNECTED:
+                    break
                 frame = worker.get_frame()
                 await websocket.send_bytes(encode_jpeg_rgb(frame))
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
+        # The client can disconnect between the state check above and send_bytes,
+        # which uvicorn surfaces as a RuntimeError instead of WebSocketDisconnect.
         pass
     finally:
         if worker:
